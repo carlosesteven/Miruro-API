@@ -149,8 +149,8 @@ cd mac_agent
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-playwright install chrome   # or rely on an already-installed Google Chrome — channel="chrome"
-                             # drives the real installed browser, not Playwright's bundled one
+patchright install chrome   # or rely on an already-installed Google Chrome — channel="chrome"
+                             # drives the real installed browser, not patchright's bundled one
 
 # Run it in the foreground once first to confirm it starts cleanly:
 python refresher.py

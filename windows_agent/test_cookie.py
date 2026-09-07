@@ -26,7 +26,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 import os
 
 import httpx
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 
 MIRURO_BASE_URL = os.getenv("MIRURO_BASE_URL", "https://www.miruro.to").rstrip("/")
 MIRURO_PIPE_URL = f"{MIRURO_BASE_URL}/api/secure/pipe"

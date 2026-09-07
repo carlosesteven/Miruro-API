@@ -45,7 +45,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import httpx
 import redis.asyncio as aioredis
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [mac_agent] %(message)s")
 logger = logging.getLogger(__name__)
