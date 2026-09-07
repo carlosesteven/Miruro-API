@@ -168,6 +168,18 @@ Uses a dedicated, throwaway Chrome profile (`mac_agent/.chrome-profile/`, gitign
 than the user's live daily-driver profile — this never conflicts with the user actually using
 Chrome at the same time as a refresh runs.
 
+### `windows_agent/` — one-off diagnostic, not wired into the fleet
+
+`windows_agent/test_cookie.py` answers one question: does a given machine's real Chrome reliably
+get a `cf_clearance` that works against the actual pipe paths the API needs, not just the
+homepage? It solves the Cloudflare challenge (same real-Chrome approach as `mac_agent/`, no
+Xvfb needed) and then tests the resulting cookie against the SAME production endpoints —
+`/recent-episodes` (pipe path `schedule`) and `/watch` (pipe path `episodes` then `sources`) —
+instead of an arbitrary canary. Prints a PASS/FAIL summary. **Does not write to Redis or notify
+anyone** — it's a standalone test, used to evaluate whether a residential/cloud-desktop Windows
+box is a viable second source of `cf_clearance` before wiring it into the reactive/pub-sub flow
+the way `mac_agent/` is. See the run instructions at the bottom of the file itself.
+
 ### Security middleware (`secure_api`)
 
 Every non-doc request must pass one of two checks (checked in order):
