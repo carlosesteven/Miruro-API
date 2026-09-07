@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -61,6 +62,9 @@ HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
 # set to this machine's ZeroTier address on the cloud nodes' .env.
 NOTIFY_RELAY_URL = os.getenv("NOTIFY_RELAY_URL", "").rstrip("/")
 API_KEY = os.getenv("API_KEY")
+
+# Same NODE_ID convention as api.py — set per-node in .env, falls back to the OS hostname.
+NODE_ID = os.getenv("NODE_ID") or socket.gethostname()
 
 
 def notify_telegram(message: str) -> None:
@@ -215,9 +219,9 @@ async def main():
         vigencia = f"la cookie actual vence en ~{ttl // 60} min" if ttl and ttl > 0 else "no hay ninguna cookie vigente en este momento"
 
         notify_telegram(
-            "⚠️ MI-API: cf_refresher no pudo resolver el challenge de Cloudflare de Miruro "
-            f"({e}). {vigencia}. Generá un cf_clearance nuevo desde tu equipo (misma IP) y "
-            "pasámelo para que lo aplique."
+            f"⚠️ MI-API [nodo: {NODE_ID}]: cf_refresher no pudo resolver el "
+            f"challenge de Cloudflare de Miruro ({e}). {vigencia}. Generá un cf_clearance nuevo "
+            "desde tu equipo (misma IP) y pasámelo para que lo aplique."
         )
         sys.exit(1)
 

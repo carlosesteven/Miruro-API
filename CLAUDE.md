@@ -138,6 +138,7 @@ Episode IDs returned by the Miruro pipe are base64-encoded. `_translate_id()` de
 | `PIPE_EXTRA_HEADERS` | `{}` | JSON object merged into pipe request headers (e.g. `sec-ch-ua`, `accept`, `cf_clearance`-adjacent headers) — used to adapt to Cloudflare without touching code |
 | `CACHE_EPISODES_HOURS` | `1` | TTL (hours) for the `/episodes/{id}` cache |
 | `NOTIFY_RELAY_URL` | `` (empty) | Base URL of the home node (`http://10.147.19.131:8848` over ZeroTier), used by cloud nodes to relay Telegram alerts through `POST /internal/notify` when no local Hermes install exists. Leave unset on the home node itself. |
+| `NODE_ID` | OS hostname | Human-readable label for this node (e.g. `cloud-1`), appended to Telegram alerts as `[nodo: ...]` so you know which of the 5 nodes actually detected the failure. |
 
 ### Deployment targets
 

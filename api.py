@@ -1,4 +1,4 @@
-import base64, json, gzip, httpx, os, subprocess, time
+import base64, json, gzip, httpx, os, socket, subprocess, time
 from pathlib import Path
 from curl_cffi.requests import AsyncSession as CurlSession
 import redis.asyncio as aioredis
@@ -237,6 +237,10 @@ CF_REFRESHER_TRIGGER_LOCK_KEY = "miruro_api:cf_refresher:reactive_trigger_lock"
 CF_REFRESHER_TRIGGER_LOCK_TTL = 60  # de-dupes concurrent failing requests into one browser run
 HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
 
+# Identifies which of the 5 nodes an alert came from. Set NODE_ID per-node (e.g. "cloud-1") in
+# each .env for a human-friendly label; falls back to the OS hostname when unset.
+NODE_ID = os.getenv("NODE_ID") or socket.gethostname()
+
 # This app runs on 5 nodes behind a load balancer (this home machine + 4 cloud nodes), but only
 # THIS one has Hermes installed (it's the physical machine, Hermes lives on it directly). A
 # cloud node has no local Hermes to shell out to, so it relays the message over the shared
@@ -274,10 +278,38 @@ def _notify_telegram(message: str) -> None:
         pass
 
 
+# Known-good, stable canary query for validating whether cf_clearance itself is actually dead.
+# anilistId 21 (One Piece) is about as safe a bet as exists for "this is in Miruro's catalog" —
+# confirmed to keep working across everything else that happened today.
+_CANARY_PIPE_PAYLOAD = {"path": "episodes", "method": "GET", "query": {"anilistId": 21}, "body": None, "version": "0.1.0"}
+
+
+async def _cf_clearance_actually_broken() -> bool:
+    """A 403 on one specific request is NOT proof the cookie is dead — confirmed live today:
+    anilistId 154587 and 269 both 403 with a perfectly healthy cf_clearance, because Miruro's
+    own catalog just doesn't have them (nothing to do with Cloudflare). Re-check with a known-
+    stable query before spending a real browser launch on it — only that result decides whether
+    the cookie is actually the problem."""
+    headers = await _get_pipe_headers()
+    if "cookie" not in headers:
+        return True  # nothing cached at all — definitely broken, no canary needed
+
+    url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(_CANARY_PIPE_PAYLOAD)}"
+    try:
+        async with httpx.AsyncClient(timeout=10, http2=True) as client:
+            res = await client.get(url, headers=headers)
+        return res.status_code != 200
+    except Exception:
+        return True  # couldn't even connect — treat as broken, safe default
+
+
 async def _trigger_reactive_cf_refresh() -> None:
     """Fires a forced cf_refresher.py run in the background (deduped via a short Redis lock so
     a burst of concurrently-failing requests doesn't spawn one browser per request) and sends an
     immediate Telegram heads-up. Never raises — this runs from inside an error path."""
+    if not await _cf_clearance_actually_broken():
+        return  # confirmed via canary: this 403 wasn't about the cookie, nothing to fix
+
     try:
         got_lock = await redis_client.set(
             CF_REFRESHER_TRIGGER_LOCK_KEY, "1", nx=True, ex=CF_REFRESHER_TRIGGER_LOCK_TTL
@@ -289,8 +321,8 @@ async def _trigger_reactive_cf_refresh() -> None:
         return  # another failing request already triggered a refresh moments ago
 
     _notify_telegram(
-        "⚠️ MI-API: el pipe de Miruro rechazó la cookie actual (403 en vivo). "
-        "Disparando un refresh forzado ahora mismo — si en ~1 min sigue caído, "
+        f"⚠️ MI-API [nodo: {NODE_ID}]: el pipe de Miruro rechazó la cookie actual "
+        "(403 en vivo). Disparando un refresh forzado ahora mismo — si en ~1 min sigue caído, "
         "necesito una cf_clearance nueva desde tu equipo."
     )
     try:
@@ -355,6 +387,11 @@ async def _pipe_get(encoded_req: str) -> dict:
     except Exception:
         raise HTTPException(status_code=503, detail="Pipe unavailable")
     if res.status_code != 200:
+        # No cookie was even in Redis to try (that's what put us on this fallback path at
+        # all) — a 403 here means the same thing it does on the httpx/cookie path above:
+        # nothing usable is cached, kick a forced re-solve instead of staying down silently.
+        if res.status_code == 403:
+            await _trigger_reactive_cf_refresh()
         status = res.status_code if 100 <= res.status_code <= 599 else 502
         raise HTTPException(status_code=status, detail="Pipe request failed")
     try:
