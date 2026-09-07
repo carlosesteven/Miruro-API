@@ -32,6 +32,9 @@ MIRURO_BASE_URL = os.getenv("MIRURO_BASE_URL", "https://www.miruro.to").rstrip("
 MIRURO_PIPE_URL = f"{MIRURO_BASE_URL}/api/secure/pipe"
 
 CHALLENGE_TIMEOUT_SECONDS = 45
+# Cloudflare's challenge page title, localized by the browser's Accept-Language — seen both as
+# English ("Just a moment...") and Spanish ("Un momento...") live.
+_CHALLENGE_TITLE_MARKERS = ("just a moment", "un momento")
 POLL_INTERVAL_SECONDS = 2
 
 CAPTURED_HEADER_NAMES = {
@@ -115,7 +118,7 @@ async def solve_challenge_and_capture():
                     # actually navigated off the challenge screen, or we can grab a stale/
                     # provisional value and close the browser before the real clearance lands.
                     title = (await page.title()).lower()
-                    if "just a moment" not in title:
+                    if not any(marker in title for marker in _CHALLENGE_TITLE_MARKERS):
                         cf_clearance = match["value"]
                         break
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)

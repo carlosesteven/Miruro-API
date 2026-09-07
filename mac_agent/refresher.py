@@ -65,6 +65,9 @@ REDIS_TTL_SECONDS = 25 * 60
 
 POLL_INTERVAL_SECONDS = int(os.getenv("MAC_AGENT_POLL_INTERVAL_SECONDS", str(30 * 60)))
 CHALLENGE_TIMEOUT_SECONDS = 45
+# Cloudflare's challenge page title, localized by the browser's Accept-Language — seen both as
+# English ("Just a moment...") and Spanish ("Un momento...") live.
+_CHALLENGE_TITLE_MARKERS = ("just a moment", "un momento")
 
 NOTIFY_RELAY_URL = os.getenv("NOTIFY_RELAY_URL", "").rstrip("/")
 API_KEY = os.getenv("API_KEY")
@@ -214,7 +217,7 @@ async def _solve_challenge_and_capture():
                     # ran twice before actually clearing) — don't trust it until the page has
                     # actually navigated off the challenge screen.
                     title = (await page.title()).lower()
-                    if "just a moment" not in title:
+                    if not any(marker in title for marker in _CHALLENGE_TITLE_MARKERS):
                         cf_clearance = match["value"]
                         break
                 await asyncio.sleep(2)
