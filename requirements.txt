@@ -1,7 +1,9 @@
 fastapi
-httpx
+httpx[http2]
 curl_cffi
 uvicorn
 mangum
 python-dotenv
 redis
+patchright
+mcp[cli]==1.28.1

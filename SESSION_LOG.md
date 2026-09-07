@@ -206,3 +206,93 @@ Es la misma raíz que el bug de `timeUntilAiring`: el snapshot que cachea Miruro
 - Se llama al final de la cadena en `get_recent_episodes()` (después de `_filter_tv_format` y `_recompute_time_until_airing`), tanto en el camino de cache-hit como en el de fetch fresco. `/recent-episodes-old` no se toca.
 
 **Verificado en local:** de los 72 items `TV`, los 72 quedan con `nextAiringEpisode.episode == episode + 1` (0 incorrectos). BLACK TORCH: `episode: 7`, `nextAiringEpisode.episode: 8` → la app calcularía `8 - 1 = 7`, correcto.
+
+---
+
+## Sesión 2026-09-07
+
+### Diagnóstico: el usuario reporta "el API ha dejado de responder"
+**Solo investigación, sin cambios de código.**
+
+- El proceso uvicorn (systemd, pid 1282, puerto 8848) está corriendo normal. `GET /health` responde `200 {"status":"ok"}` en <5ms — el proceso en sí **no está caído**.
+- Todo endpoint que depende del pipe de Miruro (`/episodes/{id}`, `/recent-episodes`, `/watch/{provider}/...`) devuelve **403 Forbidden `{"detail":"Pipe request failed"}`**. Confirmado en vivo con `curl` directo a `localhost:8848` y también reproducido llamando al pipe de Miruro directamente con `curl_cffi` (mismo protocolo que usa `_pipe_get` en `api.py`).
+- La respuesta cruda del pipe (y también de `https://www.miruro.to/` a secas, sin ninguna ruta de API) es una página Cloudflare "Just a moment..." con el header `cf-mitigated: challenge` — es decir, Cloudflare está presentando un challenge JS/Turnstile interactivo a las requests que salen desde este servidor, y como no hay navegador real que lo resuelva, cualquier request de `curl_cffi` recibe 403 sin importar el `impersonate` usado (se probó con `chrome110` hasta `chrome146`, los 9 perfiles fallan idéntico — descarta que sea un desajuste de fingerprint TLS vs User-Agent).
+- Revisando el log `uvicorn-2026-09-07-002027.log`: las requests al pipe funcionaban bien (200 OK) durante buena parte del día, empezaron a mezclarse con 403 esporádicos a partir de la línea ~5431, y escalaron a **100% de fallos** en las últimas ~100 requests antes de este diagnóstico. Patrón típico de Cloudflare subiendo el bot-score de la IP de salida del servidor hasta bloquearla del todo, no de un cambio o bug en `api.py`.
+
+**Conclusión:** no es un bug del código ni de la config del proyecto — es Miruro/Cloudflare bloqueando la IP de salida de este servidor. `PIPE_EXTRA_HEADERS` no tiene ninguna cookie `cf_clearance` seteada actualmente (solo headers `sec-ch-*`/`accept-*`), así que no hay nada que revocar ahí.
+
+**Pendiente / opciones no implementadas (requieren decisión del usuario):**
+1. Esperar — el bot-score de Cloudflare a veces baja solo pasado un tiempo sin tráfico sospechoso.
+2. Conseguir una cookie `cf_clearance` válida (resolviendo el challenge manualmente desde un navegador con la misma IP del servidor) y pasarla vía `PIPE_EXTRA_HEADERS` como `Cookie` — es frágil, expira y hay que repetirlo cada vez que Cloudflare vuelva a bloquear.
+3. Cambiar la IP de salida del servidor (nueva IP del VPS, o proxy/relay) si el bloqueo resulta ser por reputación de esa IP específica.
+4. Si el patrón se repite seguido, considerar bajar la frecuencia/volumen de requests al pipe (podría ser un bloqueo por rate más que por fingerprint).
+
+**Actualización (misma sesión): se implementó la opción 2, automatizada.** El usuario consiguió un `cf_clearance` válido a mano desde su propio navegador (Chrome real, misma IP del servidor por acuerdo de red) y confirmamos que **no está atado a la IP de origen** — solo a que los headers `sec-ch-ua`/`user-agent`/etc. coincidan exactamente con los que Cloudflare vio al emitirla. A partir de eso se armó todo un pipeline para que esto no dependa de pegar cookies a mano:
+
+### `api.py` — consumir cf_clearance desde Redis
+- Nueva constante `REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance"`.
+- Nueva función `_get_pipe_headers()` (antes de `_pipe_get`): lee un blob `{cookie, headers}` de Redis (cacheado en memoria 15s vía `CF_CLEARANCE_LOCAL_CACHE_SECONDS` para no pegarle a Redis en cada request) y arma los headers finales. **Importante:** si hay blob, se usan SUS headers tal cual (no se mezclan con el `HEADERS` estático) — mezclar `HEADERS["User-Agent"]` (mayúscula) con `blob["headers"]["user-agent"]` (minúscula) los deja como dos claves de dict distintas y manda dos headers `User-Agent` en la misma request, lo cual re-dispara el challenge. Si no hay blob en Redis, cae al comportamiento viejo (`HEADERS` estático, sin cookie).
+- `_pipe_get` ahora llama `await _get_pipe_headers()` en vez de usar `HEADERS` directo, tanto en el intento inicial como en el retry.
+
+### `cf_refresher.py` (nuevo, raíz del repo)
+Resuelve el challenge de Cloudflare con un navegador real y publica la cookie en Redis para que `api.py` la use. Hallazgos clave del desarrollo:
+- **Headless (Playwright normal, y también `patchright` que es un fork stealth) se queda colgado para siempre en "Just a moment..."** — Cloudflare lo detecta igual.
+- **No-headless (headless=False) bajo Xvfb sí lo resuelve**, típicamente en 5-10s. `patchright` (no Playwright estándar) fue el que finalmente funcionó de forma confiable en modo headful.
+- Los headers que hay que guardar junto a la cookie tienen que salir de un **fetch() same-origin real** disparado después de que el challenge se resuelve (no de la navegación inicial, que trae `sec-fetch-dest: document` en vez del shape que usa `api.py`) — hubo que esperar a que la navegación post-challenge se asiente (`wait_for_load_state("networkidle")`) antes de disparar ese fetch, si no el `page.evaluate()` explota con "Execution context was destroyed" por la carrera con la redirección de Cloudflare.
+- Publica `{cookie, headers, updated_at, source}` en Redis (`miruro_api:cf_clearance`), TTL de 25 min como red de seguridad (si el script deja de correr, `api.py` cae solo al comportamiento sin cookie en vez de reintentar una cookie ya vencida para siempre).
+- **Modo de operación (decisión del usuario):** NO refresca incondicionalmente en cada corrida del timer. Antes de lanzar el navegador chequea el TTL restante en Redis (`_current_ttl()`); si todavía quedan más de `MIN_TTL_BEFORE_REFRESH_SECONDS` (10 min), no hace nada (`SKIP`, ~1s). Solo lanza Chromium de verdad cuando el margen es bajo. Verificado en vivo: con TTL alto → `SKIP` en 1.1s; forzando TTL a 300s → refresca de verdad en ~13s.
+- **Alerta por Telegram en caso de fallo:** función `notify_telegram()` que hace `subprocess.run([HERMES_BIN, "send", "--to", "telegram", "-q", mensaje])` — mismo patrón que `wordpress_blog_animecast/animecast_ingest/notify.py` (reusa el bot de Telegram YA configurado en Hermes, `~/.hermes/.env` + `config.yaml`, sin tocar tokens desde MI-API). Con debounce de 1h (`miruro_api:cf_refresher:last_alert` en Redis, `SET NX EX`) para no spamear si Cloudflare escala a un challenge interactivo por un rato. El mensaje incluye cuánto le queda a la cookie vigente (o si ya no queda ninguna) para que el usuario sepa la urgencia. Probado en vivo end-to-end: el mensaje de prueba llegó a Telegram.
+- **Importante — el disparo de la alerta NO vigila que el API esté respondiendo.** Solo se dispara si `cf_refresher.py` efectivamente corre y falla en resolver el challenge. Si nada dispara el script (ver más abajo, timer pendiente), no hay alerta aunque el API ya esté devolviendo 403 hace rato — la cookie simplemente vence en silencio.
+
+### `mi_api_mcp.py` (nuevo) — MCP server para MI-API
+Mismo patrón que los MCP ya existentes en el server (`camaras-ip/mcp_server/camaras_mcp.py`, `hermes_animecast_scraper/jkanime_relator_mcp.py`, `wordpress_blog_animecast/animecast_blog_mcp.py`): un solo archivo, `mcp.server.fastmcp.FastMCP`, stdio, `@mcp.tool()`. **Nota de compatibilidad:** el paquete `mcp` v2.x renombró `FastMCP` a `MCPServer` y rompe este patrón — hubo que fijar `mcp[cli]==1.28.1` en `requirements.txt` (misma versión que usan los otros proyectos) para que `from mcp.server.fastmcp import FastMCP` siga funcionando.
+
+Tools expuestas:
+- `estado_cf_clearance()` — chequea TTL restante y hace cuánto se actualizó la cookie en Redis.
+- `refrescar_cf_clearance()` — dispara `cf_refresher.py` en background (`subprocess.Popen(["xvfb-run", "-a", VENV_PYTHON, CF_REFRESHER], ...)`), mismo patrón que `verificar_episodios_nuevos_jkanime()` en jkanime_relator_mcp.py.
+
+**Registro:** agregada la entrada `mi_api` en `~/.hermes/config.yaml` bajo `mcp_servers:` (mismo formato que las demás — `command`/`args`/`timeout`), apuntando al Python del propio venv de MI-API. Se corrió `systemctl --user restart hermes-gateway` para activarlo (autorizado por el usuario). Verificado con `hermes mcp test mi_api`: conecta y descubre las 2 tools.
+
+### Pendiente — timer systemd para correr `cf_refresher.py` solo
+Se crearon (en la raíz del repo, todavía no instalados en `/etc/systemd/system/`):
+- `mi-api-cf-refresh.service` — `Type=oneshot`, corre `xvfb-run -a <venv>/bin/python cf_refresher.py`.
+- `mi-api-cf-refresh.timer` — cada 15 min (`OnUnitActiveSec=15min`), `OnBootSec=2min`, `Persistent=true`.
+
+Falta que el usuario copie ambos a `/etc/systemd/system/`, `daemon-reload`, y `enable --now mi-api-cf-refresh.timer` (requiere sudo, no lo pude correr yo). **Hasta que ese timer no esté activo, nada refresca la cookie solo** — el pipe se va a volver a caer en 403 cuando la cookie actual venza, sin ninguna alerta (la alerta vive adentro de `cf_refresher.py`, que no corre si nada lo dispara).
+
+---
+
+### Incidente (misma sesión, después de lo de arriba): el API se cayó de nuevo mientras se armaba el timer
+
+**Contexto:** justo cuando se estaba por instalar el timer, el usuario preguntó "¿cómo opera exactamente el refresh, incondicional o solo si está por vencer?" — se decidió que solo refresque si el TTL de Redis está por debajo de `MIN_TTL_BEFORE_REFRESH_SECONDS` (10 min), para no lanzar Chromium 96 veces/día. Mientras se implementaba eso, el usuario reportó que el API había dejado de responder de nuevo.
+
+**Primer error propio en el diagnóstico:** se probó `/episodes/21` y devolvió 200, dando falsa confianza de que todo estaba bien. **Era un hit de la caché propia de `/episodes/{id}` (`CACHE_EPISODES_HOURS`, 1h TTL)** — esa ID se había pedido tantas veces durante las pruebas de esta sesión que quedó cacheada desde antes de que el pipe empezara a fallar de nuevo. El usuario lo notó ("me imagino que estás leyendo caché maldita sea") antes que yo. Probar con IDs nunca antes pedidas (`66`, `178789`, `196187`, etc.) confirmó que el pipe fallaba con 403 para *todo* lo que no estuviera cacheado — la lección: para validar que el pipe realmente responde, siempre probar con un ID/endpoint que no tenga caché de por medio (`/watch/...` no tiene caché, es la prueba más confiable).
+
+**Causa raíz real (encontrada en 3 pasos, cada uno descartando una hipótesis):**
+
+1. *Hipótesis descartada — cookie vencida:* se forzó un refresh nuevo de `cf_refresher.py` (borrando la key de Redis) y el pipe **seguía fallando incluso con una cookie recién emitida**, in cluso replicada con `curl` plano (sin ningún cliente Python de por medio). Esto descartó "la cookie expiró" como explicación.
+2. *Hipótesis descartada — el `cf_clearance` no cubre el endpoint del pipe:* la teoría era que `cf_refresher.py` solo resolvía el challenge contra la home (`/`) y que el pipe (`/api/secure/pipe`) tendría una regla de Cloudflare distinta. Se probó pidiendo una cookie **manual** nueva al usuario (generada en su propio dispositivo, navegando en real a miruro.to) y el mismo patrón se repitió: por `curl` plano, con la query de `episodes` codificada a mano, la request funcionaba perfecto (200). Por `api.py` (vía `curl_cffi`), la misma cookie fallaba. Esto acotó el problema a algo específico de cómo Python arma la request, no a la cookie ni al endpoint.
+3. **Causa real:** se replicó la request exacta con `httpx` (sin `curl_cffi` de por medio) y **también falló** — pero con `httpx.AsyncClient(http2=True)` explícito, funcionó (200, `http_version: HTTP/2`). **El pipe de Miruro exige HTTP/2** (como negocia cualquier navegador real y también el `curl` del sistema por default) — cualquier request sobre HTTP/1.1 (el default de `httpx`, y lo que hacía `curl_cffi` con `impersonate=chrome110`) se rechaza con 403 pese a que la cookie y los headers sean idénticos byte a byte. No era un tema de cookie, ni de TLS fingerprint, ni de headers — era el protocolo HTTP en sí.
+
+**Qué se implementó (fix definitivo):**
+- `_pipe_get()` en `api.py`: cuando hay un blob de `cf_clearance` en Redis, la request se hace con `httpx.AsyncClient(timeout=20, http2=True)` en vez de con la sesión `curl_cffi` (`pipe_session`). Requiere el paquete `h2` (`pip install "httpx[http2]"`) — agregado a `requirements.txt` como `httpx[http2]`.
+- El camino viejo (`curl_cffi`/`pipe_session`) queda como fallback solo para cuando NO hay ninguna cookie en Redis (deja de usarse en la práctica, pero no se borró — no hace daño mantenerlo).
+- Verificado en vivo con 3 IDs nunca antes pedidas + un `/watch/...` sin caché: los 4 devolvieron 200 recién restablecido el servicio.
+
+**Además, a pedido del usuario durante el incidente, se endureció todo el sistema de detección/alerta:**
+
+1. **Detección reactiva (no solo el timer):** nueva función `_trigger_reactive_cf_refresh()` en `api.py`. Cuando `_pipe_get()` recibe un 403 por el camino de `cf_clearance`, dispara en el momento (no espera al timer) `cf_refresher.py --force` en background vía `subprocess.Popen(["xvfb-run", ...])`. Un lock en Redis (`miruro_api:cf_refresher:reactive_trigger_lock`, TTL 60s) evita que varias requests fallando al mismo tiempo lancen varios navegadores — y como el lock vive en el Redis **compartido por los 5 nodos**, también deduplica across todo el fleet, no solo dentro de un proceso. Se agregó el flag `--force` a `cf_refresher.py` (bypassea el chequeo de TTL que decide si hace falta refrescar).
+2. **Sin debounce en la alerta de fallo — a pedido explícito del usuario** ("quiero spam al maldito telegram... hasta que resuelva, es un sistema crítico"): se sacó el debounce de 1h que tenía `cf_refresher.py` (`_alert_once`/`REDIS_KEY_LAST_ALERT` — eliminados del código, ya no existen). Ahora manda un mensaje cada vez que falla un intento forzado — en la práctica cada ~60s mientras la caída persista (limitado solo por el lock del punto 1, no por ningún cooldown de la alerta en sí).
+3. **Notificación desde los 5 nodos, no solo desde casa:** el usuario reveló que este servicio corre en 5 nodos detrás de un balanceador (este equipo físico + 4 nodos cloud), y **solo este equipo tiene Hermes instalado** (el framework de agente que manda a Telegram). Se agregó:
+   - `POST /internal/notify` en `api.py` — recibe `{"message": "..."}`, protegido por el mismo `x-api-key` de siempre (no está en la lista de bypass de `secure_api`), y llama a `_notify_telegram()` internamente.
+   - `_notify_telegram()` (api.py) y `notify_telegram()` (cf_refresher.py) ahora chequean primero si existe el binario local de Hermes (`/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes`); si no existe (los 4 nodos cloud), en vez de fallar en silencio, hacen un POST a `f"{NOTIFY_RELAY_URL}/internal/notify"` (nueva env var) autenticado con el mismo `API_KEY` de siempre.
+   - Confirmado con el usuario: los 5 nodos comparten Redis y el mismo `API_KEY`. Este equipo es alcanzable desde los nodos cloud vía **ZeroTier** en `10.147.19.131:8848` (confirmado con `ip addr` — interfaces `ztr2qybuq2`/`ztrfyjgylc`). Falta que el usuario agregue `NOTIFY_RELAY_URL=http://10.147.19.131:8848` al `.env` de los 4 nodos cloud y los reinicie — sin eso, esos 4 nodos no pueden avisar por Telegram si son ellos los que detectan la falla.
+
+**Estado al cierre de esta sesión:**
+- API funcionando, verificado con IDs frescos sin caché.
+- Fix de HTTP/2 aplicado y probado.
+- Detección reactiva + alerta sin debounce aplicadas y probadas (`/internal/notify` responde 200 con key válida, 403 sin key).
+- **Pendiente (requiere acción del usuario, no lo pude hacer yo por falta de sudo/acceso a los otros nodos):**
+  1. Instalar el timer systemd (`mi-api-cf-refresh.service`/`.timer`, en la raíz del repo) — ver sección anterior.
+  2. Agregar `NOTIFY_RELAY_URL=http://10.147.19.131:8848` al `.env` de los 4 nodos cloud y reiniciarlos.
+  3. Confirmar que `patchright`/Xvfb estén instalados en los nodos cloud si se espera que ellos también puedan resolver el challenge (si no, dependen de que el lock reactivo lo gane un nodo que sí pueda — típicamente este equipo de casa).

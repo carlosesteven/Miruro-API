@@ -1,4 +1,5 @@
-import base64, json, gzip, httpx, os, time
+import base64, json, gzip, httpx, os, subprocess, time
+from pathlib import Path
 from curl_cffi.requests import AsyncSession as CurlSession
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -38,6 +39,12 @@ CACHE_EPISODES_TTL = CACHE_EPISODES_HOURS * 3600  # seconds
 # --- Redis Cache Keys ---
 REDIS_KEY_RECENT_EPISODES = "miruro_api:cache:recent_episodes"
 REDIS_KEY_EPISODES_PREFIX = "miruro_api:cache:episodes"
+REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance"
+
+# How long to trust an in-memory copy of the cf_clearance blob before re-checking Redis.
+# Keeps every pipe request from doing a Redis round-trip while still picking up a
+# refreshed cookie (written by cf_refresher.py) within a few seconds of it landing.
+CF_CLEARANCE_LOCAL_CACHE_SECONDS = 15
 
 # --- Blocked Episode Source Prefixes ---
 # Comma-separated list of episode ID prefixes (the part before ':', e.g. "animepahe") to hide
@@ -195,13 +202,142 @@ async def _cache_set(key: str, value, ttl: int):
         pass
 
 
+_cf_clearance_local_cache = {"data": None, "fetched_at": 0.0}
+
+async def _get_pipe_headers() -> dict:
+    """Build headers for a pipe request. When cf_refresher.py has published a solved
+    `cf_clearance` cookie to Redis, use ITS header set verbatim (plus the cookie) — those are
+    the exact browser headers Cloudflare saw when the challenge was solved, so they must not be
+    mixed key-for-key with the static HEADERS (e.g. "User-Agent" vs "user-agent" would otherwise
+    both get sent as distinct dict keys, which no real browser does and re-triggers the
+    challenge). Falls back to the static HEADERS when Redis has nothing (or is unreachable)."""
+    now = time.time()
+    cached = _cf_clearance_local_cache
+    if now - cached["fetched_at"] > CF_CLEARANCE_LOCAL_CACHE_SECONDS:
+        blob = await _cache_get(REDIS_KEY_CF_CLEARANCE)
+        cached["data"] = blob
+        cached["fetched_at"] = now
+
+    blob = cached["data"]
+    if not blob:
+        return HEADERS
+
+    merged = dict(blob.get("headers", {}))
+    merged["cookie"] = blob["cookie"]
+    merged.setdefault("referer", HEADERS.get("Referer"))
+    return merged
+
+# --- Reactive cf_clearance recovery ---
+# A 403 through the cf_clearance/httpx path means the cached cookie just failed a REAL request
+# — stronger and faster evidence than "Redis TTL says it's still young" (that already burned us
+# once: a cookie can die well before its TTL). On that signal we kick a forced re-solve in the
+# background immediately, instead of waiting for the next timer tick (up to 15 min away).
+BASE_DIR = Path(__file__).resolve().parent
+CF_REFRESHER_TRIGGER_LOCK_KEY = "miruro_api:cf_refresher:reactive_trigger_lock"
+CF_REFRESHER_TRIGGER_LOCK_TTL = 60  # de-dupes concurrent failing requests into one browser run
+HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
+
+# This app runs on 5 nodes behind a load balancer (this home machine + 4 cloud nodes), but only
+# THIS one has Hermes installed (it's the physical machine, Hermes lives on it directly). A
+# cloud node has no local Hermes to shell out to, so it relays the message over the shared
+# ZeroTier network to THIS node's own /internal/notify instead, which does have Hermes and
+# sends it for real. NOTIFY_RELAY_URL should be unset here (home) and set to this machine's
+# ZeroTier address (e.g. http://10.147.19.131:8848) in the .env of the 4 cloud nodes.
+NOTIFY_RELAY_URL = os.getenv("NOTIFY_RELAY_URL", "").rstrip("/")
+
+
+def _notify_telegram(message: str) -> None:
+    """Best-effort, matches cf_refresher.py's notify_telegram — never let this crash a request."""
+    if os.path.exists(HERMES_BIN):
+        try:
+            subprocess.run(
+                [HERMES_BIN, "send", "--to", "telegram", "-q", message],
+                timeout=10,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            pass
+        return
+
+    if not NOTIFY_RELAY_URL:
+        return  # no local Hermes and no relay configured — nothing else we can do
+
+    try:
+        httpx.post(
+            f"{NOTIFY_RELAY_URL}/internal/notify",
+            json={"message": message},
+            headers={"x-api-key": VALID_API_KEY},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+async def _trigger_reactive_cf_refresh() -> None:
+    """Fires a forced cf_refresher.py run in the background (deduped via a short Redis lock so
+    a burst of concurrently-failing requests doesn't spawn one browser per request) and sends an
+    immediate Telegram heads-up. Never raises — this runs from inside an error path."""
+    try:
+        got_lock = await redis_client.set(
+            CF_REFRESHER_TRIGGER_LOCK_KEY, "1", nx=True, ex=CF_REFRESHER_TRIGGER_LOCK_TTL
+        ) if REDIS_ENABLED else True
+    except Exception:
+        got_lock = True  # Redis hiccup shouldn't block the recovery attempt itself
+
+    if not got_lock:
+        return  # another failing request already triggered a refresh moments ago
+
+    _notify_telegram(
+        "⚠️ MI-API: el pipe de Miruro rechazó la cookie actual (403 en vivo). "
+        "Disparando un refresh forzado ahora mismo — si en ~1 min sigue caído, "
+        "necesito una cf_clearance nueva desde tu equipo."
+    )
+    try:
+        subprocess.Popen(
+            ["xvfb-run", "-a", str(BASE_DIR / "venv" / "bin" / "python"),
+             str(BASE_DIR / "cf_refresher.py"), "--force"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
 async def _pipe_get(encoded_req: str) -> dict:
     """GET the pipe and decode the response, replacing the session and retrying once on any
     failure (connection error, non-200 status, or a corrupted/truncated response body)."""
     global pipe_session
     url = f"{MIRURO_PIPE_URL}?e={encoded_req}"
+    headers = await _get_pipe_headers()
+
+    # When we have a solved cf_clearance, replay the request with plain httpx over HTTP/2
+    # instead of curl_cffi. Confirmed live: the identical cookie/headers succeed via plain
+    # system `curl` (which negotiates HTTP/2 by default) and via httpx with http2=True, but
+    # fail — same cookie, same headers — over plain HTTP/1.1 (curl_cffi's session, and httpx's
+    # own HTTP/1.1 default both 403). Cloudflare's bot-management here is keying off the
+    # HTTP/2 vs HTTP/1.1 connection itself (a real browser always negotiates h2 for this kind
+    # of XHR), not the header/cookie content — those matched byte-for-byte in every failing
+    # attempt too. http2=True requires the `h2` package (see requirements.txt).
+    if "cookie" in headers:
+        try:
+            async with httpx.AsyncClient(timeout=20, http2=True) as client:
+                res = await client.get(url, headers=headers)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Pipe unavailable")
+        if res.status_code != 200:
+            if res.status_code == 403:
+                await _trigger_reactive_cf_refresh()
+            status = res.status_code if 100 <= res.status_code <= 599 else 502
+            raise HTTPException(status_code=status, detail="Pipe request failed")
+        try:
+            return _decode_pipe_response(res.text.strip())
+        except Exception:
+            raise HTTPException(status_code=502, detail="Pipe response corrupted")
+
     try:
-        res = await pipe_session.get(url, headers=HEADERS)
+        res = await pipe_session.get(url, headers=headers)
         if res.status_code == 200:
             return _decode_pipe_response(res.text.strip())
     except Exception:
@@ -215,7 +351,7 @@ async def _pipe_get(encoded_req: str) -> dict:
         pass
 
     try:
-        res = await pipe_session.get(url, headers=HEADERS)
+        res = await pipe_session.get(url, headers=headers)
     except Exception:
         raise HTTPException(status_code=503, detail="Pipe unavailable")
     if res.status_code != 200:
@@ -667,6 +803,18 @@ async def get_recent(
 @app.get("/health")
 async def health():
     """Basic liveness check — always returns 200 if the server is up. Bypasses auth."""
+    return {"status": "ok"}
+
+
+@app.post("/internal/notify")
+async def internal_notify(payload: dict):
+    """Telegram-alert relay for the 4 cloud nodes, which have no local Hermes install — see
+    NOTIFY_RELAY_URL above. Protected by the normal x-api-key/origin check (not in the auth
+    bypass list), so only requests carrying this deployment's own API_KEY get through."""
+    message = payload.get("message")
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+    _notify_telegram(message)
     return {"status": "ok"}
 
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=MI-API — refresca el cf_clearance de Cloudflare para el pipe de Miruro
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=carlos-esteven
+WorkingDirectory=/home/carlos-esteven/MI-API
+ExecStart=/usr/bin/xvfb-run -a /home/carlos-esteven/MI-API/venv/bin/python /home/carlos-esteven/MI-API/cf_refresher.py
+TimeoutStartSec=90

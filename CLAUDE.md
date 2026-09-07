@@ -22,12 +22,92 @@ docker run -p 8000:8000 miruro-api
 
 There is no test suite and no linting configuration.
 
+## Deployment: 5 nodes, one is special
+
+This app runs on 5 nodes behind a load balancer: 4 cloud nodes + **this physical home machine**
+(`home.csc-lab.co`, reachable from the cloud nodes over ZeroTier at `10.147.19.131`). Only this
+home machine has Hermes (a personal agent framework) installed, which is how Telegram alerts get
+sent — see `NOTIFY_RELAY_URL` below. All 5 nodes share the same Redis instance and the same
+`API_KEY`.
+
 ## Architecture
 
 The entire API lives in a single file: `api.py` (~1100 lines). It is a FastAPI app that acts as a thin, authenticated proxy over two upstream sources:
 
 1. **AniList GraphQL** (`https://graphql.anilist.co`) — all anime metadata: search, filter, collections, info, characters, relations, recommendations.
-2. **Miruro Pipe** (`{MIRURO_BASE_URL}/api/secure/pipe`) — episode lists and M3U8 streaming URLs. Miruro's pipe protocol base64-encodes and gzip-compresses every request and response; `_encode_pipe_request()` and `_decode_pipe_response()` handle this transparently. The pipe sits behind Cloudflare TLS-fingerprint bot detection, so requests go through `curl_cffi` (`impersonate="chrome110"`) instead of `httpx` — a global `pipe_session` is reused across requests and auto-replaced on failure (see `_fetch_raw_episodes`, `_fetch_raw_recents`, `get_sources`).
+2. **Miruro Pipe** (`{MIRURO_BASE_URL}/api/secure/pipe`) — episode lists and M3U8 streaming URLs. Miruro's pipe protocol base64-encodes (no gzip) every request and gzip+base64-compresses every response; `_encode_pipe_request()` and `_decode_pipe_response()` handle this transparently.
+
+### Cloudflare `cf_clearance` — required to reach the pipe at all
+
+Miruro's Cloudflare zone serves an interactive JS challenge ("Just a moment...") to this app's
+traffic. A valid `cf_clearance` cookie (plus the exact browser headers it was solved with) is
+required on every pipe request, or Cloudflare 403s it. Two things had to be true at once for
+this to work reliably, both found the hard way (see `SESSION_LOG.md`, sessions 2026-09-07):
+
+1. **Getting the cookie**: solving the challenge requires a real, non-headless browser. Headless
+   Chromium (plain Playwright, and `patchright`'s stealth fork) gets stuck on the challenge
+   forever. `cf_refresher.py` solves it with `patchright` in **non-headless** mode under **Xvfb**
+   (`xvfb-run -a`), which works in ~10-15s. It publishes `{cookie, headers}` as JSON to the Redis
+   key `miruro_api:cf_clearance` (`_get_pipe_headers()` reads it, cached in-process for
+   `CF_CLEARANCE_LOCAL_CACHE_SECONDS`). The cookie is **not** tied to the requesting IP (verified:
+   a cookie solved on one device works fine replayed from this server) — it's tied to the header
+   set (`sec-ch-ua`/`user-agent`/etc.) matching exactly what Cloudflare saw when it was issued.
+2. **Replaying the cookie**: even with a byte-for-byte matching cookie+headers, the pipe still
+   403s if the request goes out over plain **HTTP/1.1** — `curl_cffi` (any `impersonate=` profile)
+   and httpx's default both failed live; only HTTP/2 (`httpx.AsyncClient(http2=True)`, matching
+   what a real browser and system `curl` both negotiate by default) gets a 200. `_pipe_get()` uses
+   `httpx` with `http2=True` whenever a `cf_clearance` blob is present in Redis, falling back to
+   the old `curl_cffi` (`impersonate=PIPE_IMPERSONATE`) `pipe_session` only when Redis has nothing
+   cached (rare/degraded path, effectively dead weight now but kept as a fallback).
+
+**Keeping the cookie fresh — two triggers, not one:**
+- *Proactive*: `cf_refresher.py` is meant to run on a timer (`mi-api-cf-refresh.timer`/`.service`,
+  **not yet installed** as of 2026-09-07 — see SESSION_LOG). It checks the cookie's Redis TTL
+  first and skips (no browser launch) unless TTL < `MIN_TTL_BEFORE_REFRESH_SECONDS` (10 min) —
+  cuts real Chromium/challenge-solve runs down from one per timer tick to only when actually
+  needed.
+- *Reactive* (the one that matters for uptime): when a live pipe request gets a 403 with a
+  cookie set, `api.py`'s `_trigger_reactive_cf_refresh()` fires immediately — a Redis lock
+  (`miruro_api:cf_refresher:reactive_trigger_lock`, 60s TTL) de-dupes concurrent failures across
+  ALL 5 nodes into one browser launch, and `cf_refresher.py --force` (bypasses the TTL-skip
+  check) runs in the background. Recovery for subsequent requests: ~15-30s. A Redis TTL that
+  says "still valid" is **not proof the cookie actually works** (learned the hard way) — the
+  reactive path is what actually catches real breakage, the proactive timer is just cheap
+  insurance between failures.
+- If the forced refresh itself fails (e.g. Cloudflare escalates to an interactive Turnstile a
+  non-headless-but-still-automated browser can't solve), the service **stays down** — there's no
+  further automatic fallback. A human has to solve the challenge in a real browser and hand the
+  `cf_clearance` + full header set over to be pushed into Redis manually.
+- **Alerting is intentionally NOT debounced** — every failed forced-refresh attempt sends a
+  Telegram message (capped at ~once/minute by the 60s trigger lock, not by any cooldown on the
+  alert itself). This is deliberate: it's a critical service with apps depending on uptime: the
+  user wants to be spammed, not softly notified once.
+
+### `NOTIFY_RELAY_URL` — Telegram alerts from the 4 cloud nodes
+
+Only the home node has Hermes installed, so `notify_telegram()`/`_notify_telegram()` check for
+the local Hermes binary first (`/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes`); if
+it's missing (any cloud node), they POST `{"message": ...}` to `f"{NOTIFY_RELAY_URL}/internal/notify"`
+instead, authenticated with this deployment's own `API_KEY`. `POST /internal/notify` (in
+`api.py`) is what actually calls Hermes on the receiving end — it's a normal endpoint (not in the
+auth-bypass list), so it's protected by the same `x-api-key` check as everything else. Leave
+`NOTIFY_RELAY_URL` unset on the home node; set it to `http://10.147.19.131:8848` (the home
+node's ZeroTier address) on the 4 cloud nodes.
+
+### `cf_refresher.py` and `mi_api_mcp.py` — companion files, not deployed to Vercel
+
+- `cf_refresher.py`: standalone script described above. Needs `patchright` (its browser installed
+  via `python -m patchright install chromium`) and `xvfb` (`sudo apt install xvfb`) on any node
+  that should be able to solve the Cloudflare challenge — in practice, cloud nodes may not have
+  Xvfb set up, in which case they rely on the reactive-refresh Redis lock being grabbed by the
+  home node instead (or whichever node does have Xvfb) since the cookie itself is shared via
+  Redis across the whole fleet.
+- `mi_api_mcp.py`: MCP server (stdio, `mcp.server.fastmcp.FastMCP`) exposing `estado_cf_clearance()`
+  and `refrescar_cf_clearance()` for manual diagnosis/triggering from Hermes chat. Registered in
+  `~/.hermes/config.yaml` under `mcp_servers.mi_api` (home node only — that's where Hermes runs).
+  **Pin `mcp[cli]==1.28.1` in requirements.txt** — `mcp` v2.x renamed `FastMCP` to `MCPServer` and
+  breaks this import; all the other MCP servers on this machine (`camaras_ip`, `jkanime_relator`,
+  etc.) are on 1.28.1 too, for the same reason.
 
 ### Security middleware (`secure_api`)
 
@@ -56,6 +136,8 @@ Episode IDs returned by the Miruro pipe are base64-encoded. `_translate_id()` de
 | `MIRURO_BASE_URL` | — (required) | Base domain for the Miruro pipe, e.g. `https://www.miruro.to`. No hardcoded fallback — update this if Miruro changes domains again |
 | `PIPE_USER_AGENT` | `Mozilla/5.0 (Windows NT 10.0; Win64; x64)` | User-Agent sent to the pipe |
 | `PIPE_EXTRA_HEADERS` | `{}` | JSON object merged into pipe request headers (e.g. `sec-ch-ua`, `accept`, `cf_clearance`-adjacent headers) — used to adapt to Cloudflare without touching code |
+| `CACHE_EPISODES_HOURS` | `1` | TTL (hours) for the `/episodes/{id}` cache |
+| `NOTIFY_RELAY_URL` | `` (empty) | Base URL of the home node (`http://10.147.19.131:8848` over ZeroTier), used by cloud nodes to relay Telegram alerts through `POST /internal/notify` when no local Hermes install exists. Leave unset on the home node itself. |
 
 ### Deployment targets
 
