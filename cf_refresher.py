@@ -119,10 +119,22 @@ def _encode_pipe_request(payload: dict) -> str:
 # "got a cf_clearance from the homepage" is not the same as "the pipe actually accepts it".
 # Solving the homepage challenge can succeed while Cloudflare still 403s the real pipe paths this
 # app needs (episodes, sources) — verify against both for real before ever calling this a fix.
-_VERIFY_EPISODES_PAYLOAD = {"path": "episodes", "method": "GET", "query": {"anilistId": 21}, "body": None, "version": "0.1.0"}
+#
+# Also confirmed live: Miruro's pipe responses are cached at Cloudflare's edge (this exact
+# anilistId=21 episodes query came back `cf-cache-status: HIT`, `age: 11068` — 3+ hours old). A
+# cache HIT never reaches Miruro's origin, so it says nothing about whether the cookie actually
+# works. A throwaway random field in the query changes the cache key (confirmed: flips HIT to
+# MISS, still 200) without the backend rejecting it — every verification call below is
+# cache-busted so it actually reaches the origin. This is scoped to verification only; the real
+# cookie this produces is still cached normally by Cloudflare/Redis for real traffic.
 _VERIFY_SOURCES_PROVIDER = "ally"
 _VERIFY_SOURCES_CATEGORY = "sub"
 _VERIFY_SOURCES_ANILIST_ID = 21
+
+
+def _cache_bust() -> str:
+    import random, string
+    return "".join(random.choices(string.ascii_lowercase, k=8))
 
 
 async def _cookie_actually_works(cookie_str: str, headers: dict) -> bool:
@@ -140,7 +152,12 @@ async def _cookie_actually_works(cookie_str: str, headers: dict) -> bool:
         return res
 
     try:
-        res = await _raw_call(_VERIFY_EPISODES_PAYLOAD)
+        episodes_payload = {
+            "path": "episodes", "method": "GET",
+            "query": {"anilistId": _VERIFY_SOURCES_ANILIST_ID, "_cb": _cache_bust()},
+            "body": None, "version": "0.1.0",
+        }
+        res = await _raw_call(episodes_payload)
         if res.status_code != 200:
             return False
         import base64 as _b64
@@ -178,6 +195,7 @@ async def _cookie_actually_works(cookie_str: str, headers: dict) -> bool:
                 "provider": _VERIFY_SOURCES_PROVIDER,
                 "category": _VERIFY_SOURCES_CATEGORY,
                 "anilistId": _VERIFY_SOURCES_ANILIST_ID,
+                "_cb": _cache_bust(),
             },
             "body": None,
             "version": "0.1.0",

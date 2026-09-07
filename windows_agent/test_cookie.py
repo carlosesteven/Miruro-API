@@ -60,6 +60,17 @@ def _decode_pipe_response(encoded_str: str) -> dict:
     return json.loads(gzip.decompress(base64.urlsafe_b64decode(padded)).decode())
 
 
+def _cache_bust() -> str:
+    """Miruro's pipe responses are cached at Cloudflare's edge — confirmed live: the exact same
+    anilistId=21 episodes query came back `cf-cache-status: HIT`, age 3+ hours old. A cache HIT
+    never reaches Miruro's origin, so a PASS from a cached response proves nothing about whether
+    the cookie actually works. Adding this throwaway field to a query's "query" dict changes the
+    resulting URL enough to force a MISS (confirmed live, still 200, Miruro ignores the unknown
+    field) without touching how real production traffic gets cached."""
+    import random, string
+    return "".join(random.choices(string.ascii_lowercase, k=8))
+
+
 def _translate_id(encoded_id: str) -> str:
     """Pipe episode IDs come back base64-encoded (Miruro's own encoding) — decode to plain text,
     same as api.py's _translate_id."""
@@ -153,12 +164,17 @@ async def _pipe_call(cookie_str: str, headers: dict, payload: dict):
     full_headers.setdefault("referer", f"{MIRURO_BASE_URL}/")
     url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(payload)}"
     async with httpx.AsyncClient(timeout=15, http2=True) as client:
-        return await client.get(url, headers=full_headers)
+        res = await client.get(url, headers=full_headers)
+    cache_status = res.headers.get("cf-cache-status")
+    if cache_status:
+        print(f"      (cf-cache-status: {cache_status}{', age=' + res.headers['age'] if 'age' in res.headers else ''})")
+    return res
 
 
 async def test_recent_episodes(cookie_str: str, headers: dict) -> bool:
-    """Same pipe query as GET /recent-episodes (path "schedule")."""
-    payload = {"path": "schedule", "method": "GET", "query": {"sort": ["TIME_DESC"], "newest": True}, "body": None}
+    """Same pipe query as GET /recent-episodes (path "schedule"), cache-busted (see
+    _cache_bust) so a Cloudflare edge cache HIT can't fake a pass."""
+    payload = {"path": "schedule", "method": "GET", "query": {"sort": ["TIME_DESC"], "newest": True, "_cb": _cache_bust()}, "body": None}
     try:
         res = await _pipe_call(cookie_str, headers, payload)
     except Exception as e:
@@ -182,7 +198,7 @@ async def test_watch(cookie_str: str, headers: dict) -> bool:
     (path "sources") — the exact query GET /watch ends up making against the pipe."""
     episodes_payload = {
         "path": "episodes", "method": "GET",
-        "query": {"anilistId": _PROBE_ANILIST_ID}, "body": None, "version": "0.1.0",
+        "query": {"anilistId": _PROBE_ANILIST_ID, "_cb": _cache_bust()}, "body": None, "version": "0.1.0",
     }
     try:
         res = await _pipe_call(cookie_str, headers, episodes_payload)
@@ -212,6 +228,7 @@ async def test_watch(cookie_str: str, headers: dict) -> bool:
             "provider": _PROBE_PROVIDER,
             "category": _PROBE_CATEGORY,
             "anilistId": _PROBE_ANILIST_ID,
+            "_cb": _cache_bust(),
         },
         "body": None, "version": "0.1.0",
     }

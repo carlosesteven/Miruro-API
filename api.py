@@ -304,29 +304,41 @@ def _notify_telegram(message: str) -> None:
 # anilistId 21 (One Piece) is about as safe a bet as exists for "this is in Miruro's catalog" —
 # confirmed to keep working across everything else that happened today.
 #
-# IMPORTANT: Cloudflare/Miruro evaluate different pipe "path" values independently — confirmed
+# IMPORTANT #1: Cloudflare/Miruro evaluate different pipe "path" values independently — confirmed
 # live: a cookie can 200 on "episodes" while 403ing on EVERY "sources" query (any anime, any
 # provider), and vice versa isn't guaranteed either. One canary against a single path can say
 # "cookie's fine" while the actual path a real request needed is silently broken, so this checks
 # both of the two paths this app actually uses against the pipe (episodes, sources) — "schedule"
 # isn't checked separately, /recent-episodes is low-traffic enough that a live 403 there catching
 # it is an acceptable gap for now.
-_CANARY_EPISODES_PAYLOAD = {"path": "episodes", "method": "GET", "query": {"anilistId": 21}, "body": None, "version": "0.1.0"}
-# One Piece ep 1, provider "ally"/allmanga — filled in below from a live episodes lookup so the
-# raw episodeId can't go stale; this is just the anilistId/provider/category to look it up with.
+#
+# IMPORTANT #2: Miruro's pipe responses are cached at Cloudflare's edge (confirmed live:
+# `cf-cache-status: HIT`, `age: 11068` on this exact anilistId=21 episodes query — 3+ HOURS old).
+# A cache HIT never reaches Miruro's origin at all, so it says nothing about whether cf_clearance
+# actually works — repeatedly "passed" a canary against a cookie that was actually already dead.
+# Adding a throwaway random field to the query changes the cache key (confirmed live: same query
+# plus one junk field flips `cf-cache-status` from HIT to MISS, still 200) without Miruro's
+# backend rejecting the unrecognized field — so every canary call below gets its own cache-busted
+# copy of the query, guaranteeing it actually reaches the origin.
 _CANARY_SOURCES_ANILIST_ID = 21
 _CANARY_SOURCES_PROVIDER = "ally"
 _CANARY_SOURCES_CATEGORY = "sub"
+
+
+def _cache_bust() -> str:
+    import random, string
+    return "".join(random.choices(string.ascii_lowercase, k=8))
 
 
 async def _cf_clearance_actually_broken() -> bool:
     """A 403 on one specific request is NOT proof the cookie is dead — confirmed live today:
     anilistId 154587 and 269 both 403 with a perfectly healthy cf_clearance, because Miruro's
     own catalog just doesn't have them (nothing to do with Cloudflare). Re-check with known-
-    stable queries before spending a real browser launch on it — only these results decide
-    whether the cookie is actually the problem. Does its own raw HTTP calls rather than going
-    through _pipe_get/_fetch_raw_episodes — those can themselves call back into this function on
-    a 403, and recursing here would spawn refresh attempts, not just check for them."""
+    stable, cache-busted queries before spending a real browser launch on it — only these
+    results decide whether the cookie is actually the problem. Does its own raw HTTP calls
+    rather than going through _pipe_get/_fetch_raw_episodes — those can themselves call back
+    into this function on a 403, and recursing here would spawn refresh attempts, not just check
+    for them."""
     headers = await _get_pipe_headers()
     if "cookie" not in headers:
         return True  # nothing cached at all — definitely broken, no canary needed
@@ -339,8 +351,13 @@ async def _cf_clearance_actually_broken() -> bool:
             return None
         return _decode_pipe_response(res.text.strip())
 
+    episodes_payload = {
+        "path": "episodes", "method": "GET",
+        "query": {"anilistId": _CANARY_SOURCES_ANILIST_ID, "_cb": _cache_bust()},
+        "body": None, "version": "0.1.0",
+    }
     try:
-        episodes_data = await _raw_pipe_call(_CANARY_EPISODES_PAYLOAD)
+        episodes_data = await _raw_pipe_call(episodes_payload)
     except Exception:
         return True  # couldn't even connect — treat as broken, safe default
     if episodes_data is None:
@@ -366,6 +383,7 @@ async def _cf_clearance_actually_broken() -> bool:
                 "provider": _CANARY_SOURCES_PROVIDER,
                 "category": _CANARY_SOURCES_CATEGORY,
                 "anilistId": _CANARY_SOURCES_ANILIST_ID,
+                "_cb": _cache_bust(),
             },
             "body": None,
             "version": "0.1.0",

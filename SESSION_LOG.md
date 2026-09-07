@@ -338,3 +338,28 @@ Se armó el segundo nivel de respaldo con el Mac del usuario, descrito y diseña
 - `requirements.txt`, `.env.example` (plantilla, el `.env` real queda gitignored igual que en el resto del proyecto), y `com.mi-api.mac-refresher.plist` (unidad `launchd`, con rutas placeholder que hay que reemplazar por la ruta real del clone en el Mac).
 - Documentado el setup completo paso a paso en `CLAUDE.md`, sección "`mac_agent/` — second-tier cf_clearance fallback, runs on a Mac".
 - **Pendiente:** instalar esto de verdad en el Mac del usuario y probarlo en vivo (lanzar el navegador, conseguir cookie real, confirmar que se publica en Redis y que la alerta de recuperación llega). No se ha corrido nada de esto todavía fuera de la revisión de código y el syntax-check — este servidor es Linux, no puede ejecutar la parte de Chrome real de `mac_agent`.
+
+**Actualización — se probó en vivo y funcionó, con un hallazgo nuevo (caché de Cloudflare) encontrado en el proceso.**
+
+El usuario corrió `mac_agent/refresher.py` en su Mac real (venv, `.env` propio, escuchando el canal pub/sub). Desde el servidor se simuló una rotura (`SET break_detected_at` + `SET need_mac_refresh` + `PUBLISH`) y **el Mac reaccionó solo**: abrió Chrome, resolvió el challenge, y escribió la cookie en Redis (`fuente: mac_agent` confirmado). `break_detected_at`/`need_mac_refresh` se limpiaron solos. Primer end-to-end exitoso del flujo completo servidor↔Mac.
+
+**Pero:** la cookie que consiguió el Mac solo servía para `episodes`, no para `sources`/`watch` — el mismo bug que ya se había corregido en `cf_refresher.py` (Bug #1 arriba) pero nunca se portó a `mac_agent/refresher.py`, que seguía aceptando cualquier cookie sin verificarla contra el pipe real. **Pendiente real:** portar `_cookie_actually_works()` de `cf_refresher.py` a `mac_agent/refresher.py` (no se hizo todavía en esta sesión — se priorizó restablecer el servicio primero con una cookie manual).
+
+**Simplificación de `.env` a pedido del usuario ("no quiero doble .env"):** `mac_agent/refresher.py` cargaba su propio `mac_agent/.env` — se cambió para que lea el `.env` de la raíz del repo (`Path(__file__).resolve().parent.parent / ".env"`), el mismo que ya usa `api.py`. Se plegaron `NODE_ID`, `NOTIFY_RELAY_URL` y `MAC_AGENT_POLL_INTERVAL_SECONDS` al `.env_example` de la raíz y se borró `mac_agent/.env_example` (quedaba redundante). Un solo `.env` por máquina, no uno por componente.
+
+### `windows_agent/` (nuevo) — probar si un equipo Windows (cloud/físico) sirve como fuente alternativa de cf_clearance
+
+A pedido del usuario, tras el problema del Mac (cookie parcial): un script de diagnóstico standalone, **sin integrar al flujo reactivo todavía** — no escribe a Redis, no notifica a nadie. `windows_agent/test_cookie.py`: resuelve el challenge con el Chrome real instalado (mismo enfoque que `mac_agent`, sin Xvfb) y prueba la cookie contra los endpoints reales de producción (`/recent-episodes` → path `schedule`, `/watch` → paths `episodes` luego `sources`), no contra un canario inventado. Imprime PASS/FAIL.
+
+### Hallazgo importante: Cloudflare cachea las respuestas del pipe — los canarios podían dar falso positivo
+
+Mientras se armaba `windows_agent`, el usuario preguntó específicamente "¿tiene control de que no dé falsos positivos por caché?" — buena pregunta, la respuesta era que no, y se confirmó en vivo que era un problema real:
+
+- `path: "schedule"` (recent-episodes): `cf-cache-status: HIT`, `age: 75255` (**20+ horas** de antigüedad).
+- `path: "episodes"`, anilistId 21 (el canario usado en `api.py` y `cf_refresher.py` TODO el día): también `cf-cache-status: HIT`, `age: 11068` (**3+ horas**).
+
+Un `HIT` de caché de Cloudflare **nunca llega al backend de Miruro** — significa que los dos canarios que se habían estado usando en `_cf_clearance_actually_broken()` (api.py) y `_cookie_actually_works()` (cf_refresher.py) durante buena parte del día podían estar devolviendo "la cookie sirve" sin haber validado nada de verdad contra el origen. Esto probablemente explica parte de la confusión de hoy (episodes "pasando" con cookies que después resultaban no servir para nada).
+
+**Fix (aplicado en los 3 lugares — `api.py`, `cf_refresher.py`, `windows_agent/test_cookie.py`):** se agregó un campo random (`_cache_bust()`, 8 letras al azar) a la `query` de cada canario/prueba. Confirmado en vivo: agregar ese campo (que Miruro ignora, sigue respondiendo 200 con datos válidos) cambia la cache key en Cloudflare y fuerza `cf-cache-status: MISS` — o sea, sí llega al backend real cada vez. **Importante — alcance acotado:** esto SOLO afecta las queries internas de verificación/canario. El tráfico real de usuarios (`/episodes`, `/recent-episodes`, `/watch` servidos por la API) sigue cacheando normal tanto en Cloudflare como en la caché propia de Redis (`CACHE_EPISODES_HOURS`, etc.) — no se desactivó caching de producción en ningún lado, el usuario lo preguntó explícitamente y se confirmó que no.
+
+**Pendiente:** no se ha corrido `windows_agent/test_cookie.py` todavía en una máquina Windows real (este servidor es Linux). El usuario lo va a probar en un escritorio cloud Windows.
