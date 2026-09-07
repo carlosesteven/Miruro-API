@@ -44,6 +44,11 @@ REDIS_TTL_SECONDS = 25 * 60  # safety net: if this script stops running, api.py 
                               # its static headers (no cookie) once this expires, rather than
                               # replaying a stale, already-invalid cookie forever.
 
+# Same literal key as api.py's _trigger_reactive_cf_refresh — set there the moment a break is
+# first detected, consumed here on successful recovery to log/report the REAL, measured
+# break-to-recovery time instead of an estimate.
+REDIS_KEY_BREAK_DETECTED_AT = "miruro_api:cf_refresher:break_detected_at"
+
 # Skip launching the browser entirely when the cached cookie still has plenty of life left.
 # The timer runs every 15 min; only actually refresh once we're within this margin of the
 # 25 min TTL — cuts real Chromium/Cloudflare-challenge runs from ~96/day down to whenever a
@@ -237,10 +242,24 @@ async def main():
     )
     try:
         await r.set(REDIS_KEY_CF_CLEARANCE, json.dumps(payload), ex=REDIS_TTL_SECONDS)
+        break_detected_at = await r.get(REDIS_KEY_BREAK_DETECTED_AT)
+        if break_detected_at:
+            await r.delete(REDIS_KEY_BREAK_DETECTED_AT)
     finally:
         await r.aclose()
 
     print(f"[cf_refresher] OK — refreshed cf_clearance, {len(headers)} headers captured")
+
+    # Only fire a "recovered" alert when this refresh actually closed out a detected outage
+    # (break_detected_at was set) — a routine manual/proactive refresh with nothing broken
+    # shouldn't claim a "recovery" that never happened.
+    if break_detected_at:
+        elapsed = time.time() - float(break_detected_at)
+        print(f"[cf_refresher] RECOVERY TIME: {elapsed:.1f}s (medido, no estimado)")
+        notify_telegram(
+            f"✅ MI-API [nodo: {NODE_ID}]: recuperado. Tiempo real roto→arreglado: "
+            f"{elapsed:.0f}s."
+        )
 
 
 if __name__ == "__main__":

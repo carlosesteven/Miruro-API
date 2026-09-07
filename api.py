@@ -237,6 +237,16 @@ CF_REFRESHER_TRIGGER_LOCK_KEY = "miruro_api:cf_refresher:reactive_trigger_lock"
 CF_REFRESHER_TRIGGER_LOCK_TTL = 60  # de-dupes concurrent failing requests into one browser run
 HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
 
+# Shared with cf_refresher.py (same literal key) — real, measured break-to-recovery timing
+# instead of anyone's guess. See _trigger_reactive_cf_refresh (sets it) and cf_refresher.py's
+# main() (reads/clears it and reports the actual elapsed seconds on successful recovery).
+REDIS_KEY_BREAK_DETECTED_AT = "miruro_api:cf_refresher:break_detected_at"
+
+
+def _now_str() -> str:
+    import datetime
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
 # Identifies which of the 5 nodes an alert came from. Set NODE_ID per-node (e.g. "cloud-1") in
 # each .env for a human-friendly label; falls back to the OS hostname when unset.
 NODE_ID = os.getenv("NODE_ID") or socket.gethostname()
@@ -278,29 +288,80 @@ def _notify_telegram(message: str) -> None:
         pass
 
 
-# Known-good, stable canary query for validating whether cf_clearance itself is actually dead.
+# Known-good, stable canary queries for validating whether cf_clearance itself is actually dead.
 # anilistId 21 (One Piece) is about as safe a bet as exists for "this is in Miruro's catalog" —
 # confirmed to keep working across everything else that happened today.
-_CANARY_PIPE_PAYLOAD = {"path": "episodes", "method": "GET", "query": {"anilistId": 21}, "body": None, "version": "0.1.0"}
+#
+# IMPORTANT: Cloudflare/Miruro evaluate different pipe "path" values independently — confirmed
+# live: a cookie can 200 on "episodes" while 403ing on EVERY "sources" query (any anime, any
+# provider), and vice versa isn't guaranteed either. One canary against a single path can say
+# "cookie's fine" while the actual path a real request needed is silently broken, so this checks
+# both of the two paths this app actually uses against the pipe (episodes, sources) — "schedule"
+# isn't checked separately, /recent-episodes is low-traffic enough that a live 403 there catching
+# it is an acceptable gap for now.
+_CANARY_EPISODES_PAYLOAD = {"path": "episodes", "method": "GET", "query": {"anilistId": 21}, "body": None, "version": "0.1.0"}
+# One Piece ep 1, provider "ally"/allmanga — filled in below from a live episodes lookup so the
+# raw episodeId can't go stale; this is just the anilistId/provider/category to look it up with.
+_CANARY_SOURCES_ANILIST_ID = 21
+_CANARY_SOURCES_PROVIDER = "ally"
+_CANARY_SOURCES_CATEGORY = "sub"
 
 
 async def _cf_clearance_actually_broken() -> bool:
     """A 403 on one specific request is NOT proof the cookie is dead — confirmed live today:
     anilistId 154587 and 269 both 403 with a perfectly healthy cf_clearance, because Miruro's
-    own catalog just doesn't have them (nothing to do with Cloudflare). Re-check with a known-
-    stable query before spending a real browser launch on it — only that result decides whether
-    the cookie is actually the problem."""
+    own catalog just doesn't have them (nothing to do with Cloudflare). Re-check with known-
+    stable queries before spending a real browser launch on it — only these results decide
+    whether the cookie is actually the problem. Does its own raw HTTP calls rather than going
+    through _pipe_get/_fetch_raw_episodes — those can themselves call back into this function on
+    a 403, and recursing here would spawn refresh attempts, not just check for them."""
     headers = await _get_pipe_headers()
     if "cookie" not in headers:
         return True  # nothing cached at all — definitely broken, no canary needed
 
-    url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(_CANARY_PIPE_PAYLOAD)}"
-    try:
+    async def _raw_pipe_call(payload: dict):
+        url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(payload)}"
         async with httpx.AsyncClient(timeout=10, http2=True) as client:
             res = await client.get(url, headers=headers)
-        return res.status_code != 200
+        if res.status_code != 200:
+            return None
+        return _decode_pipe_response(res.text.strip())
+
+    try:
+        episodes_data = await _raw_pipe_call(_CANARY_EPISODES_PAYLOAD)
     except Exception:
         return True  # couldn't even connect — treat as broken, safe default
+    if episodes_data is None:
+        return True
+
+    try:
+        _deep_translate(episodes_data)
+        eps = (
+            episodes_data.get("providers", {})
+            .get(_CANARY_SOURCES_PROVIDER, {})
+            .get("episodes", {})
+            .get(_CANARY_SOURCES_CATEGORY, [])
+        )
+        raw_episode_id = eps[0]["id"] if eps else None
+        if not raw_episode_id:
+            return False  # can't build the sources canary — don't block recovery on it
+
+        sources_payload = {
+            "path": "sources",
+            "method": "GET",
+            "query": {
+                "episodeId": base64.urlsafe_b64encode(raw_episode_id.encode()).decode().rstrip("="),
+                "provider": _CANARY_SOURCES_PROVIDER,
+                "category": _CANARY_SOURCES_CATEGORY,
+                "anilistId": _CANARY_SOURCES_ANILIST_ID,
+            },
+            "body": None,
+            "version": "0.1.0",
+        }
+        sources_data = await _raw_pipe_call(sources_payload)
+        return sources_data is None
+    except Exception:
+        return True
 
 
 async def _trigger_reactive_cf_refresh() -> None:
@@ -320,10 +381,19 @@ async def _trigger_reactive_cf_refresh() -> None:
     if not got_lock:
         return  # another failing request already triggered a refresh moments ago
 
+    # Records the FIRST moment of a continuous outage (NX — later retries within the same
+    # outage don't overwrite it) so cf_refresher.py can log/report the real, measured time to
+    # recovery instead of anyone eyeballing it. Cleared on successful recovery (see
+    # cf_refresher.py); the 1h expiry here is just a safety net against it never getting cleared.
+    try:
+        await redis_client.set(REDIS_KEY_BREAK_DETECTED_AT, str(time.time()), nx=True, ex=3600)
+    except Exception:
+        pass
+
     _notify_telegram(
         f"⚠️ MI-API [nodo: {NODE_ID}]: el pipe de Miruro rechazó la cookie actual "
-        "(403 en vivo). Disparando un refresh forzado ahora mismo — si en ~1 min sigue caído, "
-        "necesito una cf_clearance nueva desde tu equipo."
+        f"(403 en vivo, {_now_str()}). Disparando un refresh forzado ahora mismo — si en ~1 min "
+        "sigue caído, necesito una cf_clearance nueva desde tu equipo."
     )
     try:
         subprocess.Popen(
