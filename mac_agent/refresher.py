@@ -36,7 +36,10 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Same .env as the main repo (repo root, one directory up) — not a separate mac_agent/.env.
+# This is just a git checkout of the same repo, so it's the same file whether api.py or this
+# script reads it.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import redis.asyncio as aioredis
 from playwright.async_api import async_playwright
@@ -260,7 +263,7 @@ async def _pubsub_loop():
 
 async def main():
     if not MIRURO_BASE_URL:
-        print("MIRURO_BASE_URL not set in mac_agent/.env — see .env.example", file=sys.stderr)
+        print("MIRURO_BASE_URL not set — check the .env at the repo root", file=sys.stderr)
         sys.exit(1)
 
     logger.info(

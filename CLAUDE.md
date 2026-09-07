@@ -138,16 +138,19 @@ alongside — not after — the home node's own Linux attempt):
 **Setup on the Mac** (this Mac needs to be joined to the same ZeroTier network as the home node
 — it needs to reach both Redis and `NOTIFY_RELAY_URL`):
 ```bash
-git clone <this repo> ~/MI-API   # or wherever, then cd into it
-cd MI-API/mac_agent
+git clone <this repo> ~/MI-API   # or wherever
+cd MI-API
+cp .env_example .env   # ONE .env at the repo root, shared with api.py — mac_agent/refresher.py
+                        # reads this same file (../. env relative to mac_agent/), not a second one
+# edit .env: REDIS_HOST/PORT/PASSWORD (same as the server's), API_KEY (same shared key),
+# MIRURO_BASE_URL, NOTIFY_RELAY_URL (home node's ZeroTier address), NODE_ID (e.g. "mac")
+
+cd mac_agent
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 playwright install chrome   # or rely on an already-installed Google Chrome — channel="chrome"
                              # drives the real installed browser, not Playwright's bundled one
-cp .env_example .env
-# edit .env: REDIS_HOST/PORT/PASSWORD (same as the server's), API_KEY (same shared key),
-# NOTIFY_RELAY_URL (home node's ZeroTier address), NODE_ID (e.g. "mac")
 
 # Run it in the foreground once first to confirm it starts cleanly:
 python refresher.py
