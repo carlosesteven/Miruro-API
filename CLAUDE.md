@@ -109,6 +109,62 @@ node's ZeroTier address) on the 4 cloud nodes.
   breaks this import; all the other MCP servers on this machine (`camaras_ip`, `jkanime_relator`,
   etc.) are on 1.28.1 too, for the same reason.
 
+### `mac_agent/` — second-tier cf_clearance fallback, runs on a Mac
+
+Even the home node's own Xvfb+patchright automation eventually gets distrusted by Cloudflare —
+it's the same IP auto-solving hundreds of challenges a day, which is exactly the pattern a
+bot-management WAF learns to flag (confirmed live: it started failing to solve the challenge at
+all, escalating to what looked like an interactive Turnstile). A residential Mac running its
+actual installed Chrome, with a normal mixed human traffic history, is trusted far more —
+manually-pasted cookies from a real Mac worked every single time this happened. `mac_agent/`
+automates that same act instead of asking a human to open DevTools and copy ~20 headers by hand.
+
+**Trigger model** (server side lives in `api.py`'s `_trigger_reactive_cf_refresh`, fired
+alongside — not after — the home node's own Linux attempt):
+- `SET miruro_api:need_mac_refresh EX 600` — a durable flag, polled by `mac_agent/refresher.py`
+  every `MAC_AGENT_POLL_INTERVAL_SECONDS` (default 30 min) as the fallback for whenever the Mac
+  was asleep/offline at the moment of the real event.
+- `PUBLISH miruro_api:mac_refresh_channel` — instant reaction whenever the Mac's listener happens
+  to already be connected. Redis Pub/Sub does **not** queue messages for offline subscribers, so
+  this is the fast path, never the only path.
+- `asyncio.create_task(_escalate_if_still_broken())` — scheduled the moment a break is detected,
+  wakes once after `MAC_ESCALATION_TIMEOUT_SECONDS` (120s) and checks whether
+  `miruro_api:cf_refresher:break_detected_at` is *still* set. If so — neither the Linux attempt
+  nor the Mac actually fixed it in time — sends an escalation Telegram alert. Deliberately checks
+  the real outcome (is the cookie still broken) rather than "did the Mac acknowledge the
+  message" — an ack only proves the message arrived, not that Chrome actually solved the
+  challenge (the Linux side failed that exact way once already).
+
+**Setup on the Mac** (this Mac needs to be joined to the same ZeroTier network as the home node
+— it needs to reach both Redis and `NOTIFY_RELAY_URL`):
+```bash
+git clone <this repo> ~/MI-API   # or wherever, then cd into it
+cd MI-API/mac_agent
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+playwright install chrome   # or rely on an already-installed Google Chrome — channel="chrome"
+                             # drives the real installed browser, not Playwright's bundled one
+cp .env_example .env
+# edit .env: REDIS_HOST/PORT/PASSWORD (same as the server's), API_KEY (same shared key),
+# NOTIFY_RELAY_URL (home node's ZeroTier address), NODE_ID (e.g. "mac")
+
+# Run it in the foreground once first to confirm it starts cleanly:
+python refresher.py
+
+# Then install as a launchd agent (survives reboots/crashes):
+# 1. Edit com.mi-api.mac-refresher.plist — replace /REPLACE/WITH/PATH/TO/MI-API with the real
+#    absolute path (both occurrences).
+cp com.mi-api.mac-refresher.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.mi-api.mac-refresher.plist
+# Logs: /tmp/mi-api-mac-refresher.log and .../  -error.log
+# Stop it: launchctl unload ~/Library/LaunchAgents/com.mi-api.mac-refresher.plist
+```
+
+Uses a dedicated, throwaway Chrome profile (`mac_agent/.chrome-profile/`, gitignored) rather
+than the user's live daily-driver profile — this never conflicts with the user actually using
+Chrome at the same time as a refresh runs.
+
 ### Security middleware (`secure_api`)
 
 Every non-doc request must pass one of two checks (checked in order):

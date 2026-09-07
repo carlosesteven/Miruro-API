@@ -76,3 +76,5 @@ SESSION_LOG.md
 uvicorn-*.log
 
 uvicorn.log
+
+mac_agent/.chrome-profile/

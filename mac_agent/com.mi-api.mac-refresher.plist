@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps mac_agent/refresher.py running in the background, restarting it if it crashes and
+  starting it again on login/reboot. Setup (see CLAUDE.md "Mac agent" section for the full
+  walkthrough):
+
+    1. Replace /REPLACE/WITH/PATH/TO/MI-API below with the real absolute path to this repo
+       on this Mac (both occurrences).
+    2. cp mac_agent/com.mi-api.mac-refresher.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.mi-api.mac-refresher.plist
+
+  To stop it: launchctl unload ~/Library/LaunchAgents/com.mi-api.mac-refresher.plist
+  Logs land at /tmp/mi-api-mac-refresher.log and .../  -error.log.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mi-api.mac-refresher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE/WITH/PATH/TO/MI-API/mac_agent/venv/bin/python3</string>
+        <string>/REPLACE/WITH/PATH/TO/MI-API/mac_agent/refresher.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/REPLACE/WITH/PATH/TO/MI-API/mac_agent</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/mi-api-mac-refresher.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mi-api-mac-refresher-error.log</string>
+</dict>
+</plist>

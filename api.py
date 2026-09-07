@@ -1,4 +1,4 @@
-import base64, json, gzip, httpx, os, socket, subprocess, time
+import asyncio, base64, json, gzip, httpx, os, socket, subprocess, time
 from pathlib import Path
 from curl_cffi.requests import AsyncSession as CurlSession
 import redis.asyncio as aioredis
@@ -41,10 +41,12 @@ REDIS_KEY_RECENT_EPISODES = "miruro_api:cache:recent_episodes"
 REDIS_KEY_EPISODES_PREFIX = "miruro_api:cache:episodes"
 REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance"
 
-# How long to trust an in-memory copy of the cf_clearance blob before re-checking Redis.
-# Keeps every pipe request from doing a Redis round-trip while still picking up a
-# refreshed cookie (written by cf_refresher.py) within a few seconds of it landing.
-CF_CLEARANCE_LOCAL_CACHE_SECONDS = 15
+# How long to trust an in-memory copy of the cf_clearance blob before re-checking Redis. Kept
+# short on purpose — a stale in-memory copy right after a manual push looked exactly like a
+# still-broken service during testing (confirmed live: same cookie, 403 through the cached
+# in-memory copy, 200 straight from Redis/direct httpx). This is a critical service; a Redis
+# round-trip on every pipe request is a cost worth paying to not have that ambiguity.
+CF_CLEARANCE_LOCAL_CACHE_SECONDS = 3
 
 # --- Blocked Episode Source Prefixes ---
 # Comma-separated list of episode ID prefixes (the part before ':', e.g. "animepahe") to hide
@@ -242,6 +244,16 @@ HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
 # main() (reads/clears it and reports the actual elapsed seconds on successful recovery).
 REDIS_KEY_BREAK_DETECTED_AT = "miruro_api:cf_refresher:break_detected_at"
 
+# Second-tier fallback: the user's Mac (real Chrome, residential IP — Cloudflare trusts it far
+# more than this server's IP, which gets more suspicious the more it auto-solves challenges).
+# REDIS_KEY_NEED_MAC_REFRESH is a persistent flag (survives even if a pub/sub message is missed
+# — Redis pub/sub does NOT queue messages for offline subscribers, it's fire-and-forget) that
+# mac_agent/refresher.py polls every 30-60min as a safety net; REDIS_CHANNEL_MAC_REFRESH is the
+# instant-reaction path when the Mac's listener happens to be connected at that moment.
+REDIS_KEY_NEED_MAC_REFRESH = "miruro_api:need_mac_refresh"
+REDIS_CHANNEL_MAC_REFRESH = "miruro_api:mac_refresh_channel"
+MAC_ESCALATION_TIMEOUT_SECONDS = 120  # grace period before concluding NOBODY fixed it
+
 
 def _now_str() -> str:
     import datetime
@@ -405,6 +417,37 @@ async def _trigger_reactive_cf_refresh() -> None:
         )
     except Exception:
         pass
+
+    # Second-tier fallback, fired alongside the Linux attempt (not after it fails) — no reason
+    # to wait and see before asking the Mac too. The flag is the durable ask (mac_agent's 30-60
+    # min poll catches it even if the Mac was offline for the instant push below); the publish
+    # is just the fast path for whenever the Mac's listener happens to already be connected.
+    try:
+        await redis_client.set(REDIS_KEY_NEED_MAC_REFRESH, "1", ex=600)
+        await redis_client.publish(REDIS_CHANNEL_MAC_REFRESH, "refresh")
+    except Exception:
+        pass
+
+    # Escalate if NOTHING — not the Linux attempt, not the Mac — actually fixed it in time.
+    # Checking the real outcome (is break_detected_at still there) rather than "did the Mac
+    # acknowledge" is deliberate: an ack only proves the message arrived, not that the challenge
+    # actually got solved (we watched the Linux side fail that exact way earlier today).
+    asyncio.create_task(_escalate_if_still_broken())
+
+
+async def _escalate_if_still_broken() -> None:
+    """One-shot, scheduled the moment a break is detected. Never raises."""
+    await asyncio.sleep(MAC_ESCALATION_TIMEOUT_SECONDS)
+    try:
+        still_broken = await redis_client.exists(REDIS_KEY_BREAK_DETECTED_AT)
+    except Exception:
+        return  # can't tell either way — don't false-alarm on a Redis hiccup
+    if still_broken:
+        _notify_telegram(
+            f"🔴 MI-API [nodo: {NODE_ID}]: siguen sin resolverlo — ni el refresh automático de "
+            f"este servidor ni el Mac lo arreglaron en los últimos {MAC_ESCALATION_TIMEOUT_SECONDS}s "
+            f"({_now_str()}). Necesito una cf_clearance manual ya."
+        )
 
 
 async def _pipe_get(encoded_req: str) -> dict:

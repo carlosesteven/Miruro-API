@@ -34,7 +34,10 @@ from patchright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
+import httpx
+
 MIRURO_BASE_URL = os.getenv("MIRURO_BASE_URL").rstrip("/")
+MIRURO_PIPE_URL = f"{MIRURO_BASE_URL}/api/secure/pipe"
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
@@ -112,9 +115,78 @@ def _encode_pipe_request(payload: dict) -> str:
     return _b64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
 
 
-_VERIFY_QUERY = _encode_pipe_request(
-    {"path": "episodes", "method": "GET", "query": {"anilistId": 21}, "body": None, "version": "0.1.0"}
-)
+# Same two-path check as api.py's _cf_clearance_actually_broken — confirmed live TWICE now that
+# "got a cf_clearance from the homepage" is not the same as "the pipe actually accepts it".
+# Solving the homepage challenge can succeed while Cloudflare still 403s the real pipe paths this
+# app needs (episodes, sources) — verify against both for real before ever calling this a fix.
+_VERIFY_EPISODES_PAYLOAD = {"path": "episodes", "method": "GET", "query": {"anilistId": 21}, "body": None, "version": "0.1.0"}
+_VERIFY_SOURCES_PROVIDER = "ally"
+_VERIFY_SOURCES_CATEGORY = "sub"
+_VERIFY_SOURCES_ANILIST_ID = 21
+
+
+async def _cookie_actually_works(cookie_str: str, headers: dict) -> bool:
+    """Replays the SAME two canary queries api.py checks (episodes, then sources) against the
+    freshly-solved cookie, over HTTP/2 (confirmed: HTTP/1.1 gets rejected even with an otherwise
+    valid cookie — see api.py's _pipe_get). Only a cookie that passes both gets accepted."""
+    full_headers = dict(headers)
+    full_headers["cookie"] = cookie_str
+    full_headers.setdefault("referer", f"{MIRURO_BASE_URL}/")
+
+    async def _raw_call(payload: dict):
+        url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(payload)}"
+        async with httpx.AsyncClient(timeout=10, http2=True) as client:
+            res = await client.get(url, headers=full_headers)
+        return res
+
+    try:
+        res = await _raw_call(_VERIFY_EPISODES_PAYLOAD)
+        if res.status_code != 200:
+            return False
+        import base64 as _b64
+        import gzip as _gzip
+        raw = res.text.strip()
+        raw += "=" * (4 - len(raw) % 4)
+        episodes_data = json.loads(_gzip.decompress(_b64.urlsafe_b64decode(raw)).decode())
+
+        eps = (
+            episodes_data.get("providers", {})
+            .get(_VERIFY_SOURCES_PROVIDER, {})
+            .get("episodes", {})
+            .get(_VERIFY_SOURCES_CATEGORY, [])
+        )
+        raw_episode_id = eps[0]["id"] if eps else None
+        if not raw_episode_id:
+            return True  # episodes canary passed and there's nothing else we can check safely
+
+        # Pipe episode IDs come back base64-encoded (Miruro's own encoding, not ours) — decode to
+        # plain text first, same as api.py's _translate_id, or we'd be re-encoding an already-
+        # encoded string when building the sources query below.
+        try:
+            padded = raw_episode_id + "=" * (4 - len(raw_episode_id) % 4)
+            decoded = _b64.urlsafe_b64decode(padded).decode()
+            if ":" in decoded:
+                raw_episode_id = decoded
+        except Exception:
+            pass
+
+        sources_payload = {
+            "path": "sources",
+            "method": "GET",
+            "query": {
+                "episodeId": _b64.urlsafe_b64encode(raw_episode_id.encode()).decode().rstrip("="),
+                "provider": _VERIFY_SOURCES_PROVIDER,
+                "category": _VERIFY_SOURCES_CATEGORY,
+                "anilistId": _VERIFY_SOURCES_ANILIST_ID,
+            },
+            "body": None,
+            "version": "0.1.0",
+        }
+        res2 = await _raw_call(sources_payload)
+        return res2.status_code == 200
+    except Exception:
+        logger.exception("Verification call itself failed")
+        return False
 
 # Headers captured from an actual same-origin request made by the browser once cleared.
 # These are the ones cf_clearance validation cares about; anything not in this set (like
@@ -215,18 +287,28 @@ async def main():
         print(f"[cf_refresher] SKIP — cookie still has {ttl}s left (> {MIN_TTL_BEFORE_REFRESH_SECONDS}s margin)")
         return
 
+    failure_reason = None
+    cookie_str = headers = None
     try:
         cookie_str, headers = await _solve_challenge_and_capture()
+        if not await _cookie_actually_works(cookie_str, headers):
+            failure_reason = (
+                "resolvió el challenge de la home pero la cookie no funciona contra el pipe "
+                "real (episodes/sources) — Cloudflare está evaluando esas rutas aparte"
+            )
     except Exception as e:
-        print(f"[cf_refresher] FAILED: {e}", file=sys.stderr)
+        failure_reason = str(e)
+
+    if failure_reason:
+        print(f"[cf_refresher] FAILED: {failure_reason}", file=sys.stderr)
 
         ttl = await _current_ttl()
         vigencia = f"la cookie actual vence en ~{ttl // 60} min" if ttl and ttl > 0 else "no hay ninguna cookie vigente en este momento"
 
         notify_telegram(
-            f"⚠️ MI-API [nodo: {NODE_ID}]: cf_refresher no pudo resolver el "
-            f"challenge de Cloudflare de Miruro ({e}). {vigencia}. Generá un cf_clearance nuevo "
-            "desde tu equipo (misma IP) y pasámelo para que lo aplique."
+            f"⚠️ MI-API [nodo: {NODE_ID}]: cf_refresher no logró una cookie que funcione de "
+            f"verdad ({failure_reason}). {vigencia}. Generá un cf_clearance nuevo desde tu "
+            "equipo (misma IP) y pasámelo para que lo aplique."
         )
         sys.exit(1)
 

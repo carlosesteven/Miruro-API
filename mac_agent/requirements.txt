@@ -1,0 +1,4 @@
+playwright
+redis
+python-dotenv
+httpx
