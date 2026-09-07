@@ -108,8 +108,16 @@ async def solve_challenge_and_capture():
                 cookies = await context.cookies(MIRURO_BASE_URL)
                 match = next((c for c in cookies if c["name"] == "cf_clearance"), None)
                 if match:
-                    cf_clearance = match["value"]
-                    break
+                    # A cf_clearance cookie can appear mid-challenge (e.g. after a first round
+                    # Cloudflare then escalates past) and get superseded by a later, real one —
+                    # confirmed live: the challenge visibly ran twice, first attempt failing,
+                    # before actually clearing. Don't trust the cookie until the page has
+                    # actually navigated off the challenge screen, or we can grab a stale/
+                    # provisional value and close the browser before the real clearance lands.
+                    title = (await page.title()).lower()
+                    if "just a moment" not in title:
+                        cf_clearance = match["value"]
+                        break
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
             if not cf_clearance:

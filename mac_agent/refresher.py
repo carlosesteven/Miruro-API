@@ -209,8 +209,14 @@ async def _solve_challenge_and_capture():
                 cookies = await context.cookies(MIRURO_BASE_URL)
                 match = next((c for c in cookies if c["name"] == "cf_clearance"), None)
                 if match:
-                    cf_clearance = match["value"]
-                    break
+                    # A cf_clearance cookie can appear mid-challenge and get superseded by a
+                    # later, real one (confirmed live on windows_agent: the challenge visibly
+                    # ran twice before actually clearing) — don't trust it until the page has
+                    # actually navigated off the challenge screen.
+                    title = (await page.title()).lower()
+                    if "just a moment" not in title:
+                        cf_clearance = match["value"]
+                        break
                 await asyncio.sleep(2)
 
             if not cf_clearance:
