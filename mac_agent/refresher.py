@@ -25,6 +25,8 @@ Run via launchd (see com.mi-api.mac-refresher.plist) so it survives reboots and 
 crash — see README section in CLAUDE.md (root of MI-API repo) for setup steps.
 """
 import asyncio
+import base64
+import gzip
 import json
 import logging
 import os
@@ -41,6 +43,7 @@ from dotenv import load_dotenv
 # script reads it.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
+import httpx
 import redis.asyncio as aioredis
 from playwright.async_api import async_playwright
 
@@ -48,6 +51,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [mac_agent] %(messag
 logger = logging.getLogger(__name__)
 
 MIRURO_BASE_URL = os.getenv("MIRURO_BASE_URL", "").rstrip("/")
+MIRURO_PIPE_URL = f"{MIRURO_BASE_URL}/api/secure/pipe"
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
@@ -82,7 +86,6 @@ def notify_telegram(message: str) -> None:
         logger.warning("NOTIFY_RELAY_URL not set — can't send Telegram alert: %s", message)
         return
     try:
-        import httpx
         httpx.post(
             f"{NOTIFY_RELAY_URL}/internal/notify",
             json={"message": message},
@@ -91,6 +94,93 @@ def notify_telegram(message: str) -> None:
         )
     except Exception:
         logger.exception("Failed to relay Telegram notification")
+
+
+# Same two-path check as api.py's _cf_clearance_actually_broken / cf_refresher.py's
+# _cookie_actually_works — confirmed live: solving the homepage challenge can succeed while
+# Cloudflare still 403s the real pipe paths this app needs (episodes, sources). This Mac's first
+# real run did exactly that (got a cookie good for episodes only) before this check existed.
+#
+# Also cache-busted: Miruro's pipe responses are cached at Cloudflare's edge (confirmed live,
+# cf-cache-status: HIT, age in the hours, for this exact episodes query) — a cache HIT never
+# reaches the origin, so an un-busted check could "pass" a dead cookie. A throwaway random field
+# changes the cache key (confirmed: flips HIT->MISS, still 200) without the backend rejecting it.
+_VERIFY_PROVIDER = "ally"
+_VERIFY_CATEGORY = "sub"
+_VERIFY_ANILIST_ID = 21
+
+
+def _cache_bust() -> str:
+    import random, string
+    return "".join(random.choices(string.ascii_lowercase, k=8))
+
+
+def _translate_id(encoded_id: str) -> str:
+    """Pipe episode IDs come back base64-encoded (Miruro's own encoding) — decode to plain text,
+    same as api.py's _translate_id."""
+    try:
+        padded = encoded_id + "=" * (4 - len(encoded_id) % 4)
+        decoded = base64.urlsafe_b64decode(padded).decode()
+        return decoded if ":" in decoded else encoded_id
+    except Exception:
+        return encoded_id
+
+
+async def _cookie_actually_works(cookie_str: str, headers: dict) -> bool:
+    """Replays the same two canary queries api.py/cf_refresher.py check (episodes, then sources)
+    against the freshly-solved cookie, over HTTP/2. Only a cookie that passes both gets accepted
+    — anything less gets treated exactly like the challenge never resolved at all."""
+    full_headers = dict(headers)
+    full_headers["cookie"] = cookie_str
+    full_headers.setdefault("referer", f"{MIRURO_BASE_URL}/")
+
+    async def _raw_call(payload: dict):
+        url = f"{MIRURO_PIPE_URL}?e={base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip('=')}"
+        async with httpx.AsyncClient(timeout=10, http2=True) as client:
+            return await client.get(url, headers=full_headers)
+
+    try:
+        episodes_payload = {
+            "path": "episodes", "method": "GET",
+            "query": {"anilistId": _VERIFY_ANILIST_ID, "_cb": _cache_bust()},
+            "body": None, "version": "0.1.0",
+        }
+        res = await _raw_call(episodes_payload)
+        if res.status_code != 200:
+            return False
+
+        raw = res.text.strip()
+        raw += "=" * (4 - len(raw) % 4)
+        episodes_data = json.loads(gzip.decompress(base64.urlsafe_b64decode(raw)).decode())
+
+        eps = (
+            episodes_data.get("providers", {})
+            .get(_VERIFY_PROVIDER, {})
+            .get("episodes", {})
+            .get(_VERIFY_CATEGORY, [])
+        )
+        raw_episode_id = _translate_id(eps[0]["id"]) if eps else None
+        if not raw_episode_id:
+            return True  # episodes canary passed and there's nothing else we can check safely
+
+        sources_payload = {
+            "path": "sources",
+            "method": "GET",
+            "query": {
+                "episodeId": base64.urlsafe_b64encode(raw_episode_id.encode()).decode().rstrip("="),
+                "provider": _VERIFY_PROVIDER,
+                "category": _VERIFY_CATEGORY,
+                "anilistId": _VERIFY_ANILIST_ID,
+                "_cb": _cache_bust(),
+            },
+            "body": None,
+            "version": "0.1.0",
+        }
+        res2 = await _raw_call(sources_payload)
+        return res2.status_code == 200
+    except Exception:
+        logger.exception("Verification call itself failed")
+        return False
 
 
 async def _solve_challenge_and_capture():
@@ -187,13 +277,23 @@ async def run_refresh_once():
             host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True
         )
         try:
+            failure_reason = None
+            cookie_str = headers = None
             try:
                 cookie_str, headers = await _solve_challenge_and_capture()
+                if not await _cookie_actually_works(cookie_str, headers):
+                    failure_reason = (
+                        "resolvió el challenge pero la cookie no funciona contra el pipe real "
+                        "(episodes/sources) — mismo hueco que ya se vio con este Mac una vez"
+                    )
             except Exception as e:
-                logger.error("FAILED: %s", e)
+                failure_reason = str(e)
+
+            if failure_reason:
+                logger.error("FAILED: %s", failure_reason)
                 notify_telegram(
-                    f"⚠️ MI-API [nodo: {NODE_ID}]: tampoco pude resolver el challenge de "
-                    f"Cloudflare desde el Mac ({e}). Necesito una cf_clearance manual."
+                    f"⚠️ MI-API [nodo: {NODE_ID}]: tampoco logré una cookie que funcione de "
+                    f"verdad desde el Mac ({failure_reason}). Necesito una cf_clearance manual."
                 )
                 return
 
