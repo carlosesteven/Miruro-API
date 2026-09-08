@@ -79,3 +79,4 @@ uvicorn.log
 
 mac_agent/.chrome-profile/
 windows_agent/.chrome-profile/
+windows_agent/.chrome-profile-raw/
