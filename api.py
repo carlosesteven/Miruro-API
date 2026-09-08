@@ -514,9 +514,20 @@ async def _pipe_get(encoded_req: str) -> dict:
     # of XHR), not the header/cookie content — those matched byte-for-byte in every failing
     # attempt too. http2=True requires the `h2` package (see requirements.txt).
     if "cookie" in headers:
+        # A 429 means "rate limited right now" (e.g. our own verification calls and real
+        # traffic landing close together), not "cookie is broken" — confirmed live: a real
+        # request here got a transient 429 that cleared 5s later with the exact same cookie.
+        # Retry with backoff before surfacing it to the client; only a non-429 failure (403,
+        # etc.) is treated as a real signal below.
         try:
+            delay = 2
             async with httpx.AsyncClient(timeout=20, http2=True) as client:
-                res = await client.get(url, headers=headers)
+                for attempt in range(3):
+                    res = await client.get(url, headers=headers)
+                    if res.status_code != 429:
+                        break
+                    await asyncio.sleep(delay)
+                    delay *= 2
         except Exception:
             raise HTTPException(status_code=503, detail="Pipe unavailable")
         if res.status_code != 200:
@@ -544,7 +555,13 @@ async def _pipe_get(encoded_req: str) -> dict:
         pass
 
     try:
-        res = await pipe_session.get(url, headers=headers)
+        delay = 2
+        for attempt in range(3):
+            res = await pipe_session.get(url, headers=headers)
+            if res.status_code != 429:
+                break
+            await asyncio.sleep(delay)
+            delay *= 2
     except Exception:
         raise HTTPException(status_code=503, detail="Pipe unavailable")
     if res.status_code != 200:
