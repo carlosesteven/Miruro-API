@@ -252,6 +252,23 @@ async def _pipe_call(cookie_str: str, headers: dict, payload: dict):
         return await client.get(url, headers=full_headers)
 
 
+async def _pipe_call_with_429_retry(cookie_str: str, headers: dict, payload: dict, verbose: bool = False):
+    """A 429 means "rate limited right now", not "cookie is broken" — a hammered canary query
+    (multiple nodes/manual tests verifying at once) can trip this on a perfectly good cookie.
+    Only a 403 (or anything else) is treated as a real signal; 429 gets a couple of backed-off
+    retries before we give up and let the caller decide."""
+    delay = 3
+    for attempt in range(3):
+        res = await _pipe_call(cookie_str, headers, payload)
+        if res.status_code != 429:
+            return res
+        if verbose:
+            print(f"  -> HTTP 429 (rate limited), retry {attempt + 1}/3 in {delay}s...")
+        await asyncio.sleep(delay)
+        delay *= 2
+    return res
+
+
 async def _cookie_actually_works(cookie_str: str, headers: dict, verbose: bool = False) -> bool:
     """Only a cookie that passes both canaries gets accepted — anything less gets treated
     exactly like the challenge never resolved at all."""
@@ -261,7 +278,7 @@ async def _cookie_actually_works(cookie_str: str, headers: dict, verbose: bool =
             "query": {"anilistId": _VERIFY_ANILIST_ID, "_cb": _cache_bust()},
             "body": None, "version": "0.1.0",
         }
-        res = await _pipe_call(cookie_str, headers, episodes_payload)
+        res = await _pipe_call_with_429_retry(cookie_str, headers, episodes_payload, verbose)
         if verbose:
             print(f"  -> episodes: HTTP {res.status_code} (cf-cache-status: {res.headers.get('cf-cache-status')})")
         if res.status_code != 200:
@@ -294,7 +311,7 @@ async def _cookie_actually_works(cookie_str: str, headers: dict, verbose: bool =
             "body": None,
             "version": "0.1.0",
         }
-        res2 = await _pipe_call(cookie_str, headers, sources_payload)
+        res2 = await _pipe_call_with_429_retry(cookie_str, headers, sources_payload, verbose)
         if verbose:
             print(f"  -> sources:  HTTP {res2.status_code} (cf-cache-status: {res2.headers.get('cf-cache-status')})")
         return res2.status_code == 200

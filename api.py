@@ -352,9 +352,20 @@ async def _cf_clearance_actually_broken() -> bool:
         return True  # nothing cached at all — definitely broken, no canary needed
 
     async def _raw_pipe_call(payload: dict):
+        # A 429 means "rate limited right now" (e.g. several nodes' canary checks landing at
+        # once), not "cookie is broken" — confirmed live: a cookie the Mac fallback had just
+        # solved fresh got misread as dead this way and triggered a false alarm. Only treat a
+        # non-429 failure (403, etc.) as a real signal; a 429 gets a couple of backed-off
+        # retries first.
         url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(payload)}"
+        delay = 3
         async with httpx.AsyncClient(timeout=10, http2=True) as client:
-            res = await client.get(url, headers=headers)
+            for attempt in range(3):
+                res = await client.get(url, headers=headers)
+                if res.status_code != 429:
+                    break
+                await asyncio.sleep(delay)
+                delay *= 2
         if res.status_code != 200:
             return None
         return _decode_pipe_response(res.text.strip())
