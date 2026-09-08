@@ -148,6 +148,15 @@ _CHALLENGE_TITLE_MARKERS = ("just a moment", "un momento")
 NAKED_LAUNCH_WAIT_SECONDS = int(os.getenv("NAKED_LAUNCH_WAIT_SECONDS", "20"))
 DEBUG_PORT = 9222
 
+# Confirmed live 2026-09-07: a solved cf_clearance sometimes only gets partial trust from
+# Cloudflare — it passes "episodes" but categorically fails "sources" (any anime, any provider),
+# even from a fresh/clean IP. Rotating which resource the canary checks doesn't help (confirmed:
+# still 444'd with a brand-new anilistId+provider combo) — it's the issued cookie itself that's
+# short of full trust, not the query. A brand-new browser launch (fresh challenge solve) is what
+# actually produces a fully-trusted cookie next time, so a single partial-trust result now
+# retries with entirely new solve attempts, within the same invocation, before giving up.
+MAX_SOLVE_ATTEMPTS = int(os.getenv("MAX_SOLVE_ATTEMPTS", "3"))
+
 _MAC_CHROME_PATHS = [
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
@@ -545,15 +554,24 @@ async def run_refresh_once(force: bool = False, dry_run: bool = False) -> bool:
 
         failure_reason = None
         cookie_str = headers = None
-        try:
-            cookie_str, headers = await _solve_challenge_and_capture()
-            if not await _cookie_actually_works(cookie_str, headers, verbose=dry_run):
-                failure_reason = (
-                    "resolvió el challenge de la home pero la cookie no funciona contra el "
-                    "pipe real (episodes/sources) — Cloudflare está evaluando esas rutas aparte"
-                )
-        except Exception as e:
-            failure_reason = str(e)
+        for attempt in range(1, MAX_SOLVE_ATTEMPTS + 1):
+            failure_reason = None
+            try:
+                cookie_str, headers = await _solve_challenge_and_capture()
+                if not await _cookie_actually_works(cookie_str, headers, verbose=dry_run):
+                    failure_reason = (
+                        "resolvió el challenge de la home pero la cookie no funciona contra el "
+                        "pipe real (episodes/sources) — Cloudflare está evaluando esas rutas aparte"
+                    )
+            except Exception as e:
+                failure_reason = str(e)
+
+            if not failure_reason:
+                break  # got a fully-working cookie, no need for another attempt
+
+            if attempt < MAX_SOLVE_ATTEMPTS:
+                msg = f"[cf_refresher] intento {attempt}/{MAX_SOLVE_ATTEMPTS} falló ({failure_reason}), reintentando con un navegador nuevo..."
+                print(msg, file=sys.stderr) if not dry_run else print(f"\n{msg}")
 
         if dry_run:
             if failure_reason:
@@ -564,13 +582,13 @@ async def run_refresh_once(force: bool = False, dry_run: bool = False) -> bool:
             return not failure_reason
 
         if failure_reason:
-            print(f"[cf_refresher] FAILED: {failure_reason}", file=sys.stderr)
+            print(f"[cf_refresher] FAILED after {MAX_SOLVE_ATTEMPTS} attempts: {failure_reason}", file=sys.stderr)
             ttl = await _current_ttl()
             vigencia = f"la cookie actual vence en ~{ttl // 60} min" if ttl and ttl > 0 else "no hay ninguna cookie vigente en este momento"
             notify_telegram(
-                f"⚠️ MI-API [nodo: {NODE_ID}]: no logré una cookie que funcione de verdad "
-                f"({failure_reason}). {vigencia}. Generá un cf_clearance nuevo desde tu "
-                "equipo (misma IP) y pasámelo para que lo aplique."
+                f"⚠️ MI-API [nodo: {NODE_ID}]: no logré una cookie que funcione de verdad tras "
+                f"{MAX_SOLVE_ATTEMPTS} intentos ({failure_reason}). {vigencia}. Generá un "
+                "cf_clearance nuevo desde tu equipo (misma IP) y pasámelo para que lo aplique."
             )
             return False
 
