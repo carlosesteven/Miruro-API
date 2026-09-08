@@ -1,4 +1,0 @@
-patchright
-redis
-python-dotenv
-httpx

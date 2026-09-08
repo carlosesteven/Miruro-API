@@ -244,14 +244,22 @@ HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
 # main() (reads/clears it and reports the actual elapsed seconds on successful recovery).
 REDIS_KEY_BREAK_DETECTED_AT = "miruro_api:cf_refresher:break_detected_at"
 
-# Second-tier fallback: the user's Mac (real Chrome, residential IP — Cloudflare trusts it far
-# more than this server's IP, which gets more suspicious the more it auto-solves challenges).
-# REDIS_KEY_NEED_MAC_REFRESH is a persistent flag (survives even if a pub/sub message is missed
-# — Redis pub/sub does NOT queue messages for offline subscribers, it's fire-and-forget) that
-# mac_agent/refresher.py polls every 30-60min as a safety net; REDIS_CHANNEL_MAC_REFRESH is the
-# instant-reaction path when the Mac's listener happens to be connected at that moment.
-REDIS_KEY_NEED_MAC_REFRESH = "miruro_api:need_mac_refresh"
-REDIS_CHANNEL_MAC_REFRESH = "miruro_api:mac_refresh_channel"
+# Second-tier fallback: any machine running `cf_refresher.py --listen` (a Mac, an extra Ubuntu
+# box, a Windows box — real Chrome, a non-datacenter IP Cloudflare trusts far more than this
+# server's, which gets more suspicious the more it auto-solves challenges). REDIS_KEY_NEED_MAC_REFRESH
+# is a persistent flag (survives even if a pub/sub message is missed — Redis pub/sub does NOT
+# queue messages for offline subscribers, it's fire-and-forget) that every --listen node polls
+# every 30-60min as a safety net; REDIS_CHANNEL_MAC_REFRESH is the instant-reaction path when a
+# --listen node's listener happens to be connected at that moment.
+#
+# FALLBACK_TOPIC segments this into isolated groups — only --listen nodes sharing the SAME
+# FALLBACK_TOPIC as THIS node hear its triggers. Set the same value here and on whichever
+# --listen nodes are meant to answer for this node; give a different group a different value so
+# they never react to each other's breaks. Defaults to "default" (one shared group, the common
+# case) if unset.
+FALLBACK_TOPIC = os.getenv("FALLBACK_TOPIC", "default")
+REDIS_KEY_NEED_MAC_REFRESH = f"miruro_api:need_mac_refresh:{FALLBACK_TOPIC}"
+REDIS_CHANNEL_MAC_REFRESH = f"miruro_api:mac_refresh_channel:{FALLBACK_TOPIC}"
 MAC_ESCALATION_TIMEOUT_SECONDS = 120  # grace period before concluding NOBODY fixed it
 
 

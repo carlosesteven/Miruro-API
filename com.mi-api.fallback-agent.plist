@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keeps `cf_refresher.py --listen` running in the background on a Mac — restarts it if it
+  crashes, starts it again on login/reboot.
+
+  Setup:
+    1. Replace /REPLACE/WITH/PATH/TO/MI-API below with the real absolute path to this repo on
+       this Mac (both occurrences).
+    2. cp com.mi-api.fallback-agent.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.mi-api.fallback-agent.plist
+
+  To stop it: launchctl unload ~/Library/LaunchAgents/com.mi-api.fallback-agent.plist
+  Logs land at /tmp/mi-api-fallback-agent.log and .../  -error.log.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mi-api.fallback-agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/REPLACE/WITH/PATH/TO/MI-API/venv/bin/python3</string>
+        <string>/REPLACE/WITH/PATH/TO/MI-API/cf_refresher.py</string>
+        <string>--listen</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/REPLACE/WITH/PATH/TO/MI-API</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/mi-api-fallback-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mi-api-fallback-agent-error.log</string>
+</dict>
+</plist>

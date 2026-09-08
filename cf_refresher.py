@@ -1,41 +1,56 @@
 """Refreshes the Cloudflare `cf_clearance` cookie used to reach the Miruro pipe.
 
-Miruro's Cloudflare zone started serving an interactive JS challenge ("Just a moment...") to
-every request from this server, including ones made with curl_cffi's browser TLS impersonation
-— impersonating the TLS/HTTP fingerprint isn't enough, the challenge itself has to be solved by
-something that looks like a real browser. A plain headless Chromium (via Playwright, even with
-patchright's stealth patches) gets stuck on the challenge forever; a NON-headless Chromium run
-under Xvfb solves it in a few seconds. See SESSION_LOG.md for the investigation.
+Miruro's Cloudflare zone serves an interactive JS challenge ("Just a moment.../Un momento...")
+that has to be solved by something that looks like a real, un-instrumented browser — headless
+Chromium gets stuck on it forever, and even a real Chrome gets a cookie that silently fails
+live pipe calls if Playwright/patchright control it from the first navigation (confirmed live,
+see SESSION_LOG.md 2026-09-07): the fix is launching the browser as a bare subprocess with
+nothing attached, letting the challenge clear on its own, and only THEN attaching via
+connect_over_cdp to pull the cookie + the complete set of real request headers.
 
-This script drives that non-headless browser, waits for Cloudflare to hand out `cf_clearance`,
-captures the exact request headers the browser used to get it (sec-ch-ua/user-agent/etc. have to
-match byte-for-byte — mixing them with a different header set re-triggers the challenge), and
-publishes {cookie, headers} as JSON to the Redis key api.py reads on every pipe request
-(REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance").
+ONE script, any machine: this same file runs unchanged on this home server (Linux/Xvfb), a Mac,
+a Windows box, or any other Linux/Ubuntu box you add later — it detects the OS at runtime and
+finds the right Chrome binary (see _find_chrome_path). Only the .env differs per machine
+(NODE_ID, NOTIFY_RELAY_URL, etc.) — see CLAUDE.md for the full setup per platform.
 
-Must run with a display: `xvfb-run -a python cf_refresher.py` (systemd unit does this).
-Run on a timer well inside Cloudflare's clearance lifetime — see mi-api-cf-refresh.timer.
+Modes (CLI args):
+  (none)      One-shot: skip if the cached cookie still has plenty of TTL left, else refresh.
+              This is what api.py's reactive trigger calls.
+  --force     One-shot, skip the TTL check — always attempt.
+  --listen    Run forever as an active fallback node: Redis Pub/Sub (instant reaction) + a
+              periodic poll (durable fallback for whenever this machine was asleep/offline when
+              the trigger was published). Deploy this on any extra machine you want acting as a
+              second/third/etc. cf_clearance source.
+  --dry-run   Solve + verify only — prints PASS/FAIL against the real pipe endpoints, does NOT
+              write to Redis or notify anyone. Use this to test whether a given machine's IP is
+              even viable before deciding to run it as a --listen node.
+
+On Linux, run under a display: `xvfb-run -a python cf_refresher.py [mode]`.
 """
 import asyncio
+import base64
+import gzip
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
+import httpx
 import redis.asyncio as aioredis
 from patchright.async_api import async_playwright
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [cf_refresher] %(message)s")
 logger = logging.getLogger(__name__)
-
-import httpx
 
 MIRURO_BASE_URL = os.getenv("MIRURO_BASE_URL").rstrip("/")
 MIRURO_PIPE_URL = f"{MIRURO_BASE_URL}/api/secure/pipe"
@@ -44,7 +59,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
 REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance"
-REDIS_TTL_SECONDS = 25 * 60  # safety net: if this script stops running, api.py falls back to
+REDIS_TTL_SECONDS = 25 * 60  # safety net: if nothing refreshes it in time, api.py falls back to
                               # its static headers (no cookie) once this expires, rather than
                               # replaying a stale, already-invalid cookie forever.
 
@@ -53,22 +68,33 @@ REDIS_TTL_SECONDS = 25 * 60  # safety net: if this script stops running, api.py 
 # break-to-recovery time instead of an estimate.
 REDIS_KEY_BREAK_DETECTED_AT = "miruro_api:cf_refresher:break_detected_at"
 
-# Skip launching the browser entirely when the cached cookie still has plenty of life left.
-# The timer runs every 15 min; only actually refresh once we're within this margin of the
-# 25 min TTL — cuts real Chromium/Cloudflare-challenge runs from ~96/day down to whenever a
-# refresh is actually needed, at the cost of one extra timer tick of margin before expiry.
+# --listen mode trigger (see api.py's _trigger_reactive_cf_refresh, which publishes/sets both of
+# these alongside the home server's own one-shot attempt).
+#
+# FALLBACK_TOPIC segments this: only --listen nodes sharing the SAME topic hear each other's
+# triggers. Set the SAME FALLBACK_TOPIC on api.py's own .env and on every --listen node meant to
+# answer for it, and a DIFFERENT one for an isolated group — e.g. api.py (or whichever production
+# node) set to "groupA" only wakes up the --listen nodes also set to "groupA" (say, one Ubuntu +
+# the Mac), never the ones on "groupB" (a second Ubuntu + the Windows box). Defaults to "default"
+# so a single-group deployment (the common case) needs nothing set.
+FALLBACK_TOPIC = os.getenv("FALLBACK_TOPIC", "default")
+REDIS_KEY_NEED_FALLBACK_REFRESH = f"miruro_api:need_mac_refresh:{FALLBACK_TOPIC}"
+REDIS_CHANNEL_FALLBACK_REFRESH = f"miruro_api:mac_refresh_channel:{FALLBACK_TOPIC}"
+FALLBACK_POLL_INTERVAL_SECONDS = int(os.getenv("FALLBACK_POLL_INTERVAL_SECONDS", str(30 * 60)))
+
+# Skip launching the browser entirely when the cached cookie still has plenty of life left, in
+# one-shot (non --force, non --listen) mode — cuts real Chromium/Cloudflare-challenge runs down
+# to only when actually needed.
 MIN_TTL_BEFORE_REFRESH_SECONDS = 10 * 60
 
-# No debounce on this alert — this is a critical service with apps depending on it, and the
-# user explicitly wants a message every time this fires until it's fixed. In practice that's
-# capped at once/minute anyway: api.py only calls `cf_refresher.py --force` (which is what hits
-# this failure path) once per CF_REFRESHER_TRIGGER_LOCK_TTL (60s) no matter how many requests
-# are failing concurrently.
+# No debounce on the failure alert — this is a critical service with apps depending on it, and
+# the user explicitly wants a message every time this fires until it's fixed. In practice that's
+# capped at once/minute anyway: api.py's reactive trigger only fires once per its own 60s lock,
+# no matter how many requests are failing concurrently.
 HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
 
-# Same 5-node deployment as api.py (this home machine + 4 cloud nodes) — only this one has
-# Hermes installed locally. See NOTIFY_RELAY_URL in api.py for the full rationale; unset here,
-# set to this machine's ZeroTier address on the cloud nodes' .env.
+# Only the home node has Hermes installed locally; every other machine relays through it — see
+# NOTIFY_RELAY_URL in api.py for the full rationale. Leave unset on the home node.
 NOTIFY_RELAY_URL = os.getenv("NOTIFY_RELAY_URL", "").rstrip("/")
 API_KEY = os.getenv("API_KEY")
 
@@ -93,10 +119,10 @@ def notify_telegram(message: str) -> None:
         return
 
     if not NOTIFY_RELAY_URL:
+        logger.warning("NOTIFY_RELAY_URL not set — can't send Telegram alert: %s", message)
         return
 
     try:
-        import httpx
         httpx.post(
             f"{NOTIFY_RELAY_URL}/internal/notify",
             json={"message": message},
@@ -106,42 +132,99 @@ def notify_telegram(message: str) -> None:
     except Exception:
         logger.exception("Fallo notificando por Telegram vía el relay")
 
+
 # Cloudflare's challenge page title, localized by the browser's Accept-Language — seen both as
 # English ("Just a moment...") and Spanish ("Un momento...") live.
 _CHALLENGE_TITLE_MARKERS = ("just a moment", "un momento")
 
-# Confirmed live (windows_agent/test_late_attach.py): a Chrome launched with ZERO automation
-# attached — no Playwright/patchright control at all — clears Cloudflare's challenge on its own
-# within this window, the same way an ordinary human visit would. Only AFTER this wait do we
-# attach at all. This replaced an earlier approach where patchright launched and controlled the
-# browser from the very first navigation — that either never resolved, or resolved but with an
-# incomplete header capture (missing sec-fetch-*/cache-control/etc. — see CAPTURED_HEADER_NAMES
-# below) that made the resulting cookie fail live pipe calls even though the challenge cleared.
+# Confirmed live: a Chrome launched with ZERO automation attached — no Playwright/patchright
+# control at all — clears Cloudflare's challenge on its own within this window, the same way an
+# ordinary human visit would. Only AFTER this wait do we attach at all. Launching with
+# patchright controlling the browser from the first navigation either never resolved, or
+# resolved with an incomplete header capture that made the cookie fail live pipe calls anyway.
 NAKED_LAUNCH_WAIT_SECONDS = int(os.getenv("NAKED_LAUNCH_WAIT_SECONDS", "20"))
 DEBUG_PORT = 9222
+
+_MAC_CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+]
+_WINDOWS_CHROME_PATHS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+
+
+async def _find_chrome_path() -> str:
+    """Same technique everywhere (launch a bare Chrome subprocess), different binary per OS.
+    Prefers a real installed Chrome over patchright's own bundled Chromium wherever one exists —
+    a real install is one less thing distinguishing this from an ordinary human's browser."""
+    if sys.platform == "darwin":
+        for path in _MAC_CHROME_PATHS:
+            if os.path.exists(path):
+                return path
+        # Hardcoded paths miss non-default install locations (e.g. installed via a Downloads
+        # folder move, or synced from Time Machine to a different volume). mdfind (Spotlight)
+        # finds Chrome.app wherever the OS actually indexed it, keyed by bundle id rather than
+        # a guessed path.
+        try:
+            result = subprocess.run(
+                ["mdfind", "kMDItemCFBundleIdentifier == 'com.google.Chrome'"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for app_path in result.stdout.strip().splitlines():
+                candidate = f"{app_path}/Contents/MacOS/Google Chrome"
+                if os.path.exists(candidate):
+                    return candidate
+        except Exception:
+            pass
+        raise RuntimeError(
+            "Google Chrome no aparece instalado en este Mac (ni en las rutas estándar ni vía "
+            "mdfind/Spotlight). Instalá Chrome normal (google.com/chrome) — este script necesita "
+            "el Chrome real, no el Chromium embebido de patchright, para que Cloudflare confíe "
+            "en la sesión."
+        )
+    elif sys.platform == "win32":
+        for path in _WINDOWS_CHROME_PATHS:
+            if path and os.path.exists(path):
+                return path
+        found = shutil.which("chrome") or shutil.which("chrome.exe")
+        if found:
+            return found
+        raise RuntimeError(
+            "Google Chrome no aparece instalado en este equipo Windows (ni en las rutas "
+            "estándar ni en PATH). Instalá Chrome normal (google.com/chrome) — este script "
+            "necesita el Chrome real para que Cloudflare confíe en la sesión."
+        )
+
+    # Linux: a real install if present, else patchright's own bundled Chromium (installed via
+    # `patchright install chromium`) — works fine for this purpose, just not a "real" install.
+    found = shutil.which("google-chrome") or shutil.which("chrome")
+    if found:
+        return found
+    async with async_playwright() as p:
+        return p.chromium.executable_path
+
 
 # Must match api.py's _encode_pipe_request exactly (plain base64 of the JSON, NOT gzipped —
 # only pipe *responses* are gzip-compressed, not requests).
 def _encode_pipe_request(payload: dict) -> str:
-    import base64 as _b64
-    return _b64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
 
 
-# Same two-path check as api.py's _cf_clearance_actually_broken — confirmed live TWICE now that
-# "got a cf_clearance from the homepage" is not the same as "the pipe actually accepts it".
-# Solving the homepage challenge can succeed while Cloudflare still 403s the real pipe paths this
-# app needs (episodes, sources) — verify against both for real before ever calling this a fix.
+# Same two-path check as api.py's _cf_clearance_actually_broken — confirmed live: solving the
+# homepage challenge can succeed while Cloudflare still 403s the real pipe paths this app needs
+# (episodes, sources). Verify against both for real before ever accepting a cookie as a fix.
 #
-# Also confirmed live: Miruro's pipe responses are cached at Cloudflare's edge (this exact
-# anilistId=21 episodes query came back `cf-cache-status: HIT`, `age: 11068` — 3+ hours old). A
-# cache HIT never reaches Miruro's origin, so it says nothing about whether the cookie actually
-# works. A throwaway random field in the query changes the cache key (confirmed: flips HIT to
-# MISS, still 200) without the backend rejecting it — every verification call below is
-# cache-busted so it actually reaches the origin. This is scoped to verification only; the real
-# cookie this produces is still cached normally by Cloudflare/Redis for real traffic.
-_VERIFY_SOURCES_PROVIDER = "ally"
-_VERIFY_SOURCES_CATEGORY = "sub"
-_VERIFY_SOURCES_ANILIST_ID = 21
+# Also cache-busted: Miruro's pipe responses are cached at Cloudflare's edge (confirmed live:
+# `cf-cache-status: HIT`, age in the hours, on this exact query) — a cache HIT never reaches the
+# origin, so it says nothing about whether the cookie actually works. A throwaway random field
+# in the query changes the cache key (confirmed: flips HIT to MISS, still 200) without the
+# backend rejecting it. Scoped to verification only — real traffic still caches normally.
+_VERIFY_PROVIDER = "ally"
+_VERIFY_CATEGORY = "sub"
+_VERIFY_ANILIST_ID = 21
 
 
 def _cache_bust() -> str:
@@ -149,74 +232,76 @@ def _cache_bust() -> str:
     return "".join(random.choices(string.ascii_lowercase, k=8))
 
 
-async def _cookie_actually_works(cookie_str: str, headers: dict) -> bool:
-    """Replays the SAME two canary queries api.py checks (episodes, then sources) against the
-    freshly-solved cookie, over HTTP/2 (confirmed: HTTP/1.1 gets rejected even with an otherwise
-    valid cookie — see api.py's _pipe_get). Only a cookie that passes both gets accepted."""
+def _translate_id(encoded_id: str) -> str:
+    """Pipe episode IDs come back base64-encoded (Miruro's own encoding) — decode to plain text,
+    same as api.py's _translate_id."""
+    try:
+        padded = encoded_id + "=" * (4 - len(encoded_id) % 4)
+        decoded = base64.urlsafe_b64decode(padded).decode()
+        return decoded if ":" in decoded else encoded_id
+    except Exception:
+        return encoded_id
+
+
+async def _pipe_call(cookie_str: str, headers: dict, payload: dict):
     full_headers = dict(headers)
     full_headers["cookie"] = cookie_str
     full_headers.setdefault("referer", f"{MIRURO_BASE_URL}/")
+    url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(payload)}"
+    async with httpx.AsyncClient(timeout=10, http2=True) as client:
+        return await client.get(url, headers=full_headers)
 
-    async def _raw_call(payload: dict):
-        url = f"{MIRURO_PIPE_URL}?e={_encode_pipe_request(payload)}"
-        async with httpx.AsyncClient(timeout=10, http2=True) as client:
-            res = await client.get(url, headers=full_headers)
-        return res
 
+async def _cookie_actually_works(cookie_str: str, headers: dict, verbose: bool = False) -> bool:
+    """Only a cookie that passes both canaries gets accepted — anything less gets treated
+    exactly like the challenge never resolved at all."""
     try:
         episodes_payload = {
             "path": "episodes", "method": "GET",
-            "query": {"anilistId": _VERIFY_SOURCES_ANILIST_ID, "_cb": _cache_bust()},
+            "query": {"anilistId": _VERIFY_ANILIST_ID, "_cb": _cache_bust()},
             "body": None, "version": "0.1.0",
         }
-        res = await _raw_call(episodes_payload)
+        res = await _pipe_call(cookie_str, headers, episodes_payload)
+        if verbose:
+            print(f"  -> episodes: HTTP {res.status_code} (cf-cache-status: {res.headers.get('cf-cache-status')})")
         if res.status_code != 200:
             return False
-        import base64 as _b64
-        import gzip as _gzip
+
         raw = res.text.strip()
         raw += "=" * (4 - len(raw) % 4)
-        episodes_data = json.loads(_gzip.decompress(_b64.urlsafe_b64decode(raw)).decode())
+        episodes_data = json.loads(gzip.decompress(base64.urlsafe_b64decode(raw)).decode())
 
         eps = (
             episodes_data.get("providers", {})
-            .get(_VERIFY_SOURCES_PROVIDER, {})
+            .get(_VERIFY_PROVIDER, {})
             .get("episodes", {})
-            .get(_VERIFY_SOURCES_CATEGORY, [])
+            .get(_VERIFY_CATEGORY, [])
         )
-        raw_episode_id = eps[0]["id"] if eps else None
+        raw_episode_id = _translate_id(eps[0]["id"]) if eps else None
         if not raw_episode_id:
             return True  # episodes canary passed and there's nothing else we can check safely
-
-        # Pipe episode IDs come back base64-encoded (Miruro's own encoding, not ours) — decode to
-        # plain text first, same as api.py's _translate_id, or we'd be re-encoding an already-
-        # encoded string when building the sources query below.
-        try:
-            padded = raw_episode_id + "=" * (4 - len(raw_episode_id) % 4)
-            decoded = _b64.urlsafe_b64decode(padded).decode()
-            if ":" in decoded:
-                raw_episode_id = decoded
-        except Exception:
-            pass
 
         sources_payload = {
             "path": "sources",
             "method": "GET",
             "query": {
-                "episodeId": _b64.urlsafe_b64encode(raw_episode_id.encode()).decode().rstrip("="),
-                "provider": _VERIFY_SOURCES_PROVIDER,
-                "category": _VERIFY_SOURCES_CATEGORY,
-                "anilistId": _VERIFY_SOURCES_ANILIST_ID,
+                "episodeId": base64.urlsafe_b64encode(raw_episode_id.encode()).decode().rstrip("="),
+                "provider": _VERIFY_PROVIDER,
+                "category": _VERIFY_CATEGORY,
+                "anilistId": _VERIFY_ANILIST_ID,
                 "_cb": _cache_bust(),
             },
             "body": None,
             "version": "0.1.0",
         }
-        res2 = await _raw_call(sources_payload)
+        res2 = await _pipe_call(cookie_str, headers, sources_payload)
+        if verbose:
+            print(f"  -> sources:  HTTP {res2.status_code} (cf-cache-status: {res2.headers.get('cf-cache-status')})")
         return res2.status_code == 200
     except Exception:
         logger.exception("Verification call itself failed")
         return False
+
 
 # Headers captured from an actual same-origin request made by the browser once cleared.
 # These are the ones cf_clearance validation cares about; anything not in this set (like
@@ -231,14 +316,11 @@ CAPTURED_HEADER_NAMES = {
 
 
 async def _solve_challenge_and_capture():
-    """Launches the SAME Chromium patchright would normally control, but as a raw subprocess —
-    no Playwright/patchright attached at all — so Cloudflare's challenge gets solved exactly
-    like an ordinary browser visit, then waits untouched, and only THEN attaches via
-    connect_over_cdp to pull the cookie and headers."""
+    """Launches a bare Chrome subprocess — no Playwright/patchright attached at all — so
+    Cloudflare's challenge gets solved exactly like an ordinary browser visit, waits untouched,
+    and only THEN attaches via connect_over_cdp to pull the cookie and headers."""
+    chrome_path = await _find_chrome_path()
     profile_dir = str(Path(__file__).resolve().parent / ".chrome-profile")
-
-    async with async_playwright() as p:
-        chrome_path = p.chromium.executable_path
 
     proc = subprocess.Popen(
         [
@@ -247,11 +329,10 @@ async def _solve_challenge_and_capture():
             f"--user-data-dir={profile_dir}",
             "--no-first-run",
             "--no-default-browser-check",
-            # Confirmed live: launching Chromium as a raw subprocess (not via patchright's own
-            # launch(), which handles this internally) hits Chromium's zygote sandbox init and
-            # crashes immediately under this environment (Xvfb + this user's namespace/AppArmor
-            # setup) without it — "FATAL: No usable sandbox!". Only affects this standalone
-            # process, not anything else on the machine.
+            # Harmless on Mac/Windows; required on Linux, where launching Chromium as a raw
+            # subprocess (patchright's own launch() handles this internally, a raw subprocess
+            # doesn't) hits its zygote sandbox init and crashes immediately under Xvfb/AppArmor
+            # setups without it — confirmed live: "FATAL: No usable sandbox!".
             "--no-sandbox",
             f"{MIRURO_BASE_URL}/",
         ],
@@ -358,68 +439,149 @@ async def _current_ttl() -> int:
         await r.aclose()
 
 
-async def main():
-    force = "--force" in sys.argv
-    ttl = await _current_ttl()
-    if not force and ttl and ttl > MIN_TTL_BEFORE_REFRESH_SECONDS:
-        print(f"[cf_refresher] SKIP — cookie still has {ttl}s left (> {MIN_TTL_BEFORE_REFRESH_SECONDS}s margin)")
-        return
+_refresh_lock = asyncio.Lock()
 
-    failure_reason = None
-    cookie_str = headers = None
-    try:
-        cookie_str, headers = await _solve_challenge_and_capture()
-        if not await _cookie_actually_works(cookie_str, headers):
-            failure_reason = (
-                "resolvió el challenge de la home pero la cookie no funciona contra el pipe "
-                "real (episodes/sources) — Cloudflare está evaluando esas rutas aparte"
+
+async def run_refresh_once(force: bool = False, dry_run: bool = False) -> bool:
+    """Core logic shared by every mode. Returns True on a verified-working refresh.
+
+    dry_run=True: solves + verifies, prints PASS/FAIL, never touches Redis or Telegram — use to
+    test whether a machine's IP is even viable before deciding to run it with --listen.
+    """
+    if _refresh_lock.locked():
+        logger.info("A refresh is already in progress, skipping this trigger")
+        return False
+
+    async with _refresh_lock:
+        if not dry_run and not force:
+            ttl = await _current_ttl()
+            if ttl and ttl > MIN_TTL_BEFORE_REFRESH_SECONDS:
+                print(f"[cf_refresher] SKIP — cookie still has {ttl}s left (> {MIN_TTL_BEFORE_REFRESH_SECONDS}s margin)")
+                return False
+
+        failure_reason = None
+        cookie_str = headers = None
+        try:
+            cookie_str, headers = await _solve_challenge_and_capture()
+            if not await _cookie_actually_works(cookie_str, headers, verbose=dry_run):
+                failure_reason = (
+                    "resolvió el challenge de la home pero la cookie no funciona contra el "
+                    "pipe real (episodes/sources) — Cloudflare está evaluando esas rutas aparte"
+                )
+        except Exception as e:
+            failure_reason = str(e)
+
+        if dry_run:
+            if failure_reason:
+                print(f"\nFAILED: {failure_reason}")
+            else:
+                print(f"\nOK — cookie works for episodes AND sources ({len(headers)} headers captured).")
+                print("Nothing was written to Redis and no one was notified — this was a dry run.")
+            return not failure_reason
+
+        if failure_reason:
+            print(f"[cf_refresher] FAILED: {failure_reason}", file=sys.stderr)
+            ttl = await _current_ttl()
+            vigencia = f"la cookie actual vence en ~{ttl // 60} min" if ttl and ttl > 0 else "no hay ninguna cookie vigente en este momento"
+            notify_telegram(
+                f"⚠️ MI-API [nodo: {NODE_ID}]: no logré una cookie que funcione de verdad "
+                f"({failure_reason}). {vigencia}. Generá un cf_clearance nuevo desde tu "
+                "equipo (misma IP) y pasámelo para que lo aplique."
             )
-    except Exception as e:
-        failure_reason = str(e)
+            return False
 
-    if failure_reason:
-        print(f"[cf_refresher] FAILED: {failure_reason}", file=sys.stderr)
+        payload = {
+            "cookie": cookie_str,
+            "headers": headers,
+            "updated_at": int(time.time()),
+            "source": NODE_ID,
+        }
 
-        ttl = await _current_ttl()
-        vigencia = f"la cookie actual vence en ~{ttl // 60} min" if ttl and ttl > 0 else "no hay ninguna cookie vigente en este momento"
-
-        notify_telegram(
-            f"⚠️ MI-API [nodo: {NODE_ID}]: cf_refresher no logró una cookie que funcione de "
-            f"verdad ({failure_reason}). {vigencia}. Generá un cf_clearance nuevo desde tu "
-            "equipo (misma IP) y pasámelo para que lo aplique."
+        r = aioredis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True
         )
-        sys.exit(1)
+        try:
+            await r.set(REDIS_KEY_CF_CLEARANCE, json.dumps(payload), ex=REDIS_TTL_SECONDS)
+            await r.delete(REDIS_KEY_NEED_FALLBACK_REFRESH)
+            break_detected_at = await r.get(REDIS_KEY_BREAK_DETECTED_AT)
+            if break_detected_at:
+                await r.delete(REDIS_KEY_BREAK_DETECTED_AT)
+        finally:
+            await r.aclose()
 
-    payload = {
-        "cookie": cookie_str,
-        "headers": headers,
-        "updated_at": int(time.time()),
-        "source": "cf_refresher.py",
-    }
+        print(f"[cf_refresher] OK — refreshed cf_clearance, {len(headers)} headers captured")
 
+        # Only fire a "recovered" alert when this refresh actually closed out a detected outage
+        # — a routine manual/proactive refresh with nothing broken shouldn't claim a "recovery"
+        # that never happened.
+        if break_detected_at:
+            elapsed = time.time() - float(break_detected_at)
+            print(f"[cf_refresher] RECOVERY TIME: {elapsed:.1f}s (medido, no estimado)")
+            notify_telegram(
+                f"✅ MI-API [nodo: {NODE_ID}]: recuperado. Tiempo real roto→arreglado: "
+                f"{elapsed:.0f}s."
+            )
+        return True
+
+
+async def _poll_loop():
+    """--listen mode, durable path: catches the case where a pub/sub trigger was published
+    while this machine was asleep/offline/disconnected and therefore never received."""
     r = aioredis.Redis(
         host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True
     )
     try:
-        await r.set(REDIS_KEY_CF_CLEARANCE, json.dumps(payload), ex=REDIS_TTL_SECONDS)
-        break_detected_at = await r.get(REDIS_KEY_BREAK_DETECTED_AT)
-        if break_detected_at:
-            await r.delete(REDIS_KEY_BREAK_DETECTED_AT)
+        while True:
+            await asyncio.sleep(FALLBACK_POLL_INTERVAL_SECONDS)
+            try:
+                needed = await r.get(REDIS_KEY_NEED_FALLBACK_REFRESH)
+            except Exception:
+                logger.exception("Poll check failed (Redis unreachable?)")
+                continue
+            if needed:
+                logger.info("Poll found the refresh flag set — running refresh")
+                await run_refresh_once(force=True)
     finally:
         await r.aclose()
 
-    print(f"[cf_refresher] OK — refreshed cf_clearance, {len(headers)} headers captured")
 
-    # Only fire a "recovered" alert when this refresh actually closed out a detected outage
-    # (break_detected_at was set) — a routine manual/proactive refresh with nothing broken
-    # shouldn't claim a "recovery" that never happened.
-    if break_detected_at:
-        elapsed = time.time() - float(break_detected_at)
-        print(f"[cf_refresher] RECOVERY TIME: {elapsed:.1f}s (medido, no estimado)")
-        notify_telegram(
-            f"✅ MI-API [nodo: {NODE_ID}]: recuperado. Tiempo real roto→arreglado: "
-            f"{elapsed:.0f}s."
-        )
+async def _pubsub_loop():
+    """--listen mode, fast path: instant reaction whenever this listener is connected at
+    publish time. Pub/Sub is fire-and-forget — Redis does NOT queue messages for offline
+    subscribers — so _poll_loop above is the durable complement, not redundant."""
+    r = aioredis.Redis(
+        host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True
+    )
+    pubsub = r.pubsub()
+    await pubsub.subscribe(REDIS_CHANNEL_FALLBACK_REFRESH)
+    logger.info("Listening on %s for instant refresh requests", REDIS_CHANNEL_FALLBACK_REFRESH)
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+            logger.info("Received instant refresh request via pub/sub")
+            await run_refresh_once(force=True)
+    finally:
+        await pubsub.aclose()
+        await r.aclose()
+
+
+async def listen_forever():
+    logger.info(
+        "Listening as a fallback node [%s] — poll every %ss, instant pub/sub also active",
+        NODE_ID, FALLBACK_POLL_INTERVAL_SECONDS,
+    )
+    await asyncio.gather(_pubsub_loop(), _poll_loop())
+
+
+async def main():
+    if "--listen" in sys.argv:
+        await listen_forever()
+        return
+
+    ok = await run_refresh_once(force="--force" in sys.argv, dry_run="--dry-run" in sys.argv)
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

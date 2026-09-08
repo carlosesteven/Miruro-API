@@ -1,0 +1,16 @@
+[Unit]
+Description=MI-API cf_clearance fallback agent (cf_refresher.py --listen)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=REPLACE_WITH_YOUR_USER
+WorkingDirectory=/REPLACE/WITH/PATH/TO/MI-API
+ExecStart=/usr/bin/xvfb-run -a /REPLACE/WITH/PATH/TO/MI-API/venv/bin/python /REPLACE/WITH/PATH/TO/MI-API/cf_refresher.py --listen
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

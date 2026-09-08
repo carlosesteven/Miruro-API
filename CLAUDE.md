@@ -105,91 +105,104 @@ auth-bypass list), so it's protected by the same `x-api-key` check as everything
 `NOTIFY_RELAY_URL` unset on the home node; set it to `http://10.147.19.131:8848` (the home
 node's ZeroTier address) on the 4 cloud nodes.
 
-### `cf_refresher.py` and `mi_api_mcp.py` — companion files, not deployed to Vercel
+### `cf_refresher.py` — ONE script, any OS, four modes
 
-- `cf_refresher.py`: standalone script described above. Needs `patchright` (its browser installed
-  via `python -m patchright install chromium`) and `xvfb` (`sudo apt install xvfb`) on any node
-  that should be able to solve the Cloudflare challenge — in practice, cloud nodes may not have
-  Xvfb set up, in which case they rely on the reactive-refresh Redis lock being grabbed by the
-  home node instead (or whichever node does have Xvfb) since the cookie itself is shared via
-  Redis across the whole fleet.
-- `mi_api_mcp.py`: MCP server (stdio, `mcp.server.fastmcp.FastMCP`) exposing `estado_cf_clearance()`
-  and `refrescar_cf_clearance()` for manual diagnosis/triggering from Hermes chat. Registered in
-  `~/.hermes/config.yaml` under `mcp_servers.mi_api` (home node only — that's where Hermes runs).
-  **Pin `mcp[cli]==1.28.1` in requirements.txt** — `mcp` v2.x renamed `FastMCP` to `MCPServer` and
-  breaks this import; all the other MCP servers on this machine (`camaras_ip`, `jkanime_relator`,
-  etc.) are on 1.28.1 too, for the same reason.
+Solves the Cloudflare challenge and refreshes `miruro_api:cf_clearance`. Runs **unchanged** on
+this home server, a Mac, a Windows box, or any extra Linux/Ubuntu machine you add later — it
+detects the OS at runtime (`_find_chrome_path`) and finds the right Chrome binary; only the
+`.env` differs per machine (`NODE_ID`, `NOTIFY_RELAY_URL`, etc — same one `.env` as `api.py`,
+never a separate copy per machine). There used to be separate `mac_agent/`/`windows_agent/`
+directories with near-duplicate code — collapsed into this one file once it became clear the
+only real per-OS difference is "how do I find/launch a bare Chrome", not the surrounding logic.
 
-### `mac_agent/` — second-tier cf_clearance fallback, runs on a Mac
+**Modes** (CLI args):
+| Mode | What it does |
+|---|---|
+| *(none)* | One-shot: skip if the cached cookie still has plenty of TTL left, else refresh. This is what `api.py`'s reactive trigger calls. |
+| `--force` | One-shot, skip the TTL check — always attempt. |
+| `--listen` | Run forever as an active fallback node: Redis Pub/Sub (instant reaction) + a periodic poll (durable fallback for whenever this machine was asleep/offline when the trigger was published). Deploy this on any extra machine you want acting as a second/third/etc. `cf_clearance` source. |
+| `--dry-run` | Solve + verify only — prints PASS/FAIL against the real pipe endpoints (`episodes` then `sources`, cache-busted). Does **not** write to Redis or notify anyone. Use this to test whether a machine's IP is even viable before deciding to run it with `--listen`. |
 
-Even the home node's own Xvfb+patchright automation eventually gets distrusted by Cloudflare —
-it's the same IP auto-solving hundreds of challenges a day, which is exactly the pattern a
-bot-management WAF learns to flag (confirmed live: it started failing to solve the challenge at
-all, escalating to what looked like an interactive Turnstile). A residential Mac running its
-actual installed Chrome, with a normal mixed human traffic history, is trusted far more —
-manually-pasted cookies from a real Mac worked every single time this happened. `mac_agent/`
-automates that same act instead of asking a human to open DevTools and copy ~20 headers by hand.
+**Why it needs to exist at all:** headless Chromium (plain Playwright, and `patchright`'s
+stealth fork) gets stuck on the challenge forever. Beyond that, **the browser must have ZERO
+automation attached while the challenge resolves** — confirmed live: launching Chrome with
+Playwright/patchright controlling it from the first navigation (CDP active before the page even
+loads) either never cleared the challenge, or cleared it with an incomplete header capture that
+made the resulting cookie fail live pipe calls anyway. `_solve_challenge_and_capture` launches
+the browser as a **raw subprocess** (`--remote-debugging-port` open but nothing connected), waits
+`NAKED_LAUNCH_WAIT_SECONDS` (default 20) completely untouched, and only THEN attaches via
+`connect_over_cdp` to pull the cookie. Header capture also has to merge two CDP events —
+`Network.requestWillBeSent` (has `sec-ch-ua-*`/`user-agent`) and
+`Network.requestWillBeSentExtraInfo` (has `sec-fetch-*`/`cache-control`/`pragma`/`priority`,
+which Chromium always attaches but Playwright's simple `request.headers()` doesn't expose) —
+using only the first one was silently producing incomplete, non-working cookies.
 
-**Trigger model** (server side lives in `api.py`'s `_trigger_reactive_cf_refresh`, fired
-alongside — not after — the home node's own Linux attempt):
-- `SET miruro_api:need_mac_refresh EX 600` — a durable flag, polled by `mac_agent/refresher.py`
-  every `MAC_AGENT_POLL_INTERVAL_SECONDS` (default 30 min) as the fallback for whenever the Mac
-  was asleep/offline at the moment of the real event.
-- `PUBLISH miruro_api:mac_refresh_channel` — instant reaction whenever the Mac's listener happens
-  to already be connected. Redis Pub/Sub does **not** queue messages for offline subscribers, so
-  this is the fast path, never the only path.
+**Why an extra machine at all:** even this home server's own Xvfb+patchright automation
+eventually gets distrusted by Cloudflare — it's the same IP auto-solving hundreds of challenges
+a day, which is exactly the pattern a bot-management WAF learns to flag. A residential Mac (or
+any machine on a different, less-flagged IP) running a real Chrome, with a normal mixed traffic
+history, gets trusted far more.
+
+**Second-tier trigger model** (server side lives in `api.py`'s `_trigger_reactive_cf_refresh`,
+fired alongside — not after — the home node's own one-shot attempt):
+- `SET miruro_api:need_mac_refresh EX 600` — a durable flag, polled by every `--listen` node
+  every `FALLBACK_POLL_INTERVAL_SECONDS` (default 30 min) as the fallback for whenever that
+  machine was asleep/offline at the moment of the real event. (Key name is historical — shared
+  by every fallback node, not Mac-specific.)
+- `PUBLISH miruro_api:mac_refresh_channel` — instant reaction whenever a `--listen` node's
+  listener happens to already be connected. Redis Pub/Sub does **not** queue messages for
+  offline subscribers, so this is the fast path, never the only path. Multiple `--listen` nodes
+  can be subscribed at once — a single trigger fans out to all of them, and whichever actually
+  produces a working cookie first wins (harmless if more than one succeeds; they just overwrite
+  the same Redis key with an equally-valid cookie).
 - `asyncio.create_task(_escalate_if_still_broken())` — scheduled the moment a break is detected,
   wakes once after `MAC_ESCALATION_TIMEOUT_SECONDS` (120s) and checks whether
-  `miruro_api:cf_refresher:break_detected_at` is *still* set. If so — neither the Linux attempt
-  nor the Mac actually fixed it in time — sends an escalation Telegram alert. Deliberately checks
-  the real outcome (is the cookie still broken) rather than "did the Mac acknowledge the
-  message" — an ack only proves the message arrived, not that Chrome actually solved the
-  challenge (the Linux side failed that exact way once already).
+  `miruro_api:cf_refresher:break_detected_at` is *still* set. If so — nothing anywhere fixed it
+  in time — sends an escalation Telegram alert. Deliberately checks the real outcome (is the
+  cookie still broken) rather than "did some node acknowledge the message" — an ack only proves
+  the message arrived, not that Chrome actually solved the challenge.
 
-**Setup on the Mac** (this Mac needs to be joined to the same ZeroTier network as the home node
-— it needs to reach both Redis and `NOTIFY_RELAY_URL`):
+**Setup on a new machine** (Mac, Windows, or another Linux box — needs to be joined to the same
+ZeroTier network as the home node, to reach both Redis and `NOTIFY_RELAY_URL`):
 ```bash
 git clone <this repo> ~/MI-API   # or wherever
 cd MI-API
-cp .env_example .env   # ONE .env at the repo root, shared with api.py — mac_agent/refresher.py
-                        # reads this same file (../. env relative to mac_agent/), not a second one
+cp .env_example .env
 # edit .env: REDIS_HOST/PORT/PASSWORD (same as the server's), API_KEY (same shared key),
-# MIRURO_BASE_URL, NOTIFY_RELAY_URL (home node's ZeroTier address), NODE_ID (e.g. "mac")
+# MIRURO_BASE_URL, NOTIFY_RELAY_URL (home node's ZeroTier address), NODE_ID (e.g. "mac", "cloud-ubuntu-2")
 
-cd mac_agent
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-patchright install chrome   # or rely on an already-installed Google Chrome — channel="chrome"
-                             # drives the real installed browser, not patchright's bundled one
+patchright install chromium       # Linux only — Mac/Windows use the real installed Chrome instead
 
-# Run it in the foreground once first to confirm it starts cleanly:
-python refresher.py
+# Test it works at all before wiring it into the fleet:
+python cf_refresher.py --dry-run   # Linux: xvfb-run -a python cf_refresher.py --dry-run
 
-# Then install as a launchd agent (survives reboots/crashes):
-# 1. Edit com.mi-api.mac-refresher.plist — replace /REPLACE/WITH/PATH/TO/MI-API with the real
-#    absolute path (both occurrences).
-cp com.mi-api.mac-refresher.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.mi-api.mac-refresher.plist
-# Logs: /tmp/mi-api-mac-refresher.log and .../  -error.log
-# Stop it: launchctl unload ~/Library/LaunchAgents/com.mi-api.mac-refresher.plist
+# Run it as the active fallback node:
+python cf_refresher.py --listen    # Linux: xvfb-run -a python cf_refresher.py --listen
 ```
 
-Uses a dedicated, throwaway Chrome profile (`mac_agent/.chrome-profile/`, gitignored) rather
-than the user's live daily-driver profile — this never conflicts with the user actually using
-Chrome at the same time as a refresh runs.
+Keep it running persistently:
+- **Linux**: `mi-api-fallback-agent.service` (systemd) — edit the placeholder paths/user, then
+  `sudo cp` it to `/etc/systemd/system/`, `daemon-reload`, `enable --now`.
+- **Mac**: `com.mi-api.fallback-agent.plist` (launchd) — edit the placeholder paths, then
+  `cp` to `~/Library/LaunchAgents/`, `launchctl load`.
+- **Windows**: Task Scheduler, "run at log on", pointed at `venv\Scripts\python.exe
+  cf_refresher.py --listen` with the repo as the working directory.
 
-### `windows_agent/` — one-off diagnostic, not wired into the fleet
+Uses a dedicated, throwaway Chrome profile (`.chrome-profile/`, gitignored) rather than the
+user's live daily-driver profile — this never conflicts with them actually using Chrome at the
+same time as a refresh runs.
 
-`windows_agent/test_cookie.py` answers one question: does a given machine's real Chrome reliably
-get a `cf_clearance` that works against the actual pipe paths the API needs, not just the
-homepage? It solves the Cloudflare challenge (same real-Chrome approach as `mac_agent/`, no
-Xvfb needed) and then tests the resulting cookie against the SAME production endpoints —
-`/recent-episodes` (pipe path `schedule`) and `/watch` (pipe path `episodes` then `sources`) —
-instead of an arbitrary canary. Prints a PASS/FAIL summary. **Does not write to Redis or notify
-anyone** — it's a standalone test, used to evaluate whether a residential/cloud-desktop Windows
-box is a viable second source of `cf_clearance` before wiring it into the reactive/pub-sub flow
-the way `mac_agent/` is. See the run instructions at the bottom of the file itself.
+### `mi_api_mcp.py` — MCP server for manual diagnosis (home node only)
+
+MCP server (stdio, `mcp.server.fastmcp.FastMCP`) exposing `estado_cf_clearance()` and
+`refrescar_cf_clearance()` for manual diagnosis/triggering from Hermes chat. Registered in
+`~/.hermes/config.yaml` under `mcp_servers.mi_api` (home node only — that's where Hermes runs).
+**Pin `mcp[cli]==1.28.1` in requirements.txt** — `mcp` v2.x renamed `FastMCP` to `MCPServer` and
+breaks this import; all the other MCP servers on this machine (`camaras_ip`, `jkanime_relator`,
+etc.) are on 1.28.1 too, for the same reason.
 
 ### Security middleware (`secure_api`)
 
