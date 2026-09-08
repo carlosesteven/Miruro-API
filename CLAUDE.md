@@ -58,11 +58,14 @@ this to work reliably, both found the hard way (see `SESSION_LOG.md`, sessions 2
    `Network.requestWillBeSentExtraInfo` (has `sec-fetch-*`/`cache-control`/`pragma`/`priority`,
    which Chromium always attaches but Playwright's simple `request.headers()` doesn't expose) —
    using only the first one was silently producing incomplete, non-working cookies. Publishes
-   `{cookie, headers}` as JSON to the Redis key `miruro_api:cf_clearance` (`_get_pipe_headers()`
-   reads it, cached in-process for `CF_CLEARANCE_LOCAL_CACHE_SECONDS`). The cookie is **not**
-   tied to the requesting IP (verified: a cookie solved on one device works fine replayed from
-   this server) — it's tied to the header set (`sec-ch-ua`/`user-agent`/etc.) matching exactly
-   what Cloudflare saw when it was issued.
+   `{cookie, headers}` as JSON to the Redis key `miruro_api:cf_clearance:{FALLBACK_TOPIC}`
+   (`_get_pipe_headers()` reads it, cached in-process for `CF_CLEARANCE_LOCAL_CACHE_SECONDS`).
+   The cookie is **not** tied to the requesting IP (verified: a cookie solved on one device
+   works fine replayed from this server) — it's tied to the header set (`sec-ch-ua`/`user-agent`/
+   etc.) matching exactly what Cloudflare saw when it was issued. That's *why* sharing one cookie
+   across every node used to work at all technically — but don't read that as "one shared cookie
+   is fine": see the `FALLBACK_TOPIC` isolation note below for why every group now has its own key
+   regardless, and why this is not up for debate again.
 2. **Replaying the cookie**: even with a byte-for-byte matching cookie+headers, the pipe still
    403s if the request goes out over plain **HTTP/1.1** — `curl_cffi` (any `impersonate=` profile)
    and httpx's default both failed live; only HTTP/2 (`httpx.AsyncClient(http2=True)`, matching
@@ -107,7 +110,7 @@ node's ZeroTier address) on the 4 cloud nodes.
 
 ### `cf_refresher.py` — ONE script, any OS, four modes
 
-Solves the Cloudflare challenge and refreshes `miruro_api:cf_clearance`. Runs **unchanged** on
+Solves the Cloudflare challenge and refreshes `miruro_api:cf_clearance:{FALLBACK_TOPIC}`. Runs **unchanged** on
 this home server, a Mac, a Windows box, or any extra Linux/Ubuntu machine you add later — it
 detects the OS at runtime (`_find_chrome_path`) and finds the right Chrome binary; only the
 `.env` differs per machine (`NODE_ID`, `NOTIFY_RELAY_URL`, etc — same one `.env` as `api.py`,
@@ -145,22 +148,41 @@ history, gets trusted far more.
 
 **Second-tier trigger model** (server side lives in `api.py`'s `_trigger_reactive_cf_refresh`,
 fired alongside — not after — the home node's own one-shot attempt):
-- `SET miruro_api:need_mac_refresh EX 600` — a durable flag, polled by every `--listen` node
-  every `FALLBACK_POLL_INTERVAL_SECONDS` (default 30 min) as the fallback for whenever that
-  machine was asleep/offline at the moment of the real event. (Key name is historical — shared
-  by every fallback node, not Mac-specific.)
-- `PUBLISH miruro_api:mac_refresh_channel` — instant reaction whenever a `--listen` node's
-  listener happens to already be connected. Redis Pub/Sub does **not** queue messages for
-  offline subscribers, so this is the fast path, never the only path. Multiple `--listen` nodes
-  can be subscribed at once — a single trigger fans out to all of them, and whichever actually
-  produces a working cookie first wins (harmless if more than one succeeds; they just overwrite
-  the same Redis key with an equally-valid cookie).
+- `SET miruro_api:need_mac_refresh:{FALLBACK_TOPIC} EX 600` — a durable flag, polled by every
+  `--listen` node in the same topic every `FALLBACK_POLL_INTERVAL_SECONDS` (default 30 min) as
+  the fallback for whenever that machine was asleep/offline at the moment of the real event.
+  (Key name is historical — "mac" isn't literal, it means "whichever fallback node answers for
+  this topic".)
+- `PUBLISH miruro_api:mac_refresh_channel:{FALLBACK_TOPIC}` — instant reaction whenever a
+  `--listen` node in the same topic's listener happens to already be connected. Redis Pub/Sub
+  does **not** queue messages for offline subscribers, so this is the fast path, never the only
+  path. Multiple `--listen` nodes in the same topic can be subscribed at once — a single trigger
+  fans out to all of them in that topic, and whichever actually produces a working cookie first
+  wins (harmless if more than one succeeds within the same topic; they just overwrite the same
+  Redis key with an equally-valid cookie).
 - `asyncio.create_task(_escalate_if_still_broken())` — scheduled the moment a break is detected,
   wakes once after `MAC_ESCALATION_TIMEOUT_SECONDS` (120s) and checks whether
   `miruro_api:cf_refresher:break_detected_at` is *still* set. If so — nothing anywhere fixed it
   in time — sends an escalation Telegram alert. Deliberately checks the real outcome (is the
   cookie still broken) rather than "did some node acknowledge the message" — an ack only proves
   the message arrived, not that Chrome actually solved the challenge.
+
+**`FALLBACK_TOPIC` isolates the cookie itself, not just who gets woken up — this is not
+optional, and it must never be walked back.** Every group (`{production node(s)} + {--listen
+fallback node(s)}` sharing one `FALLBACK_TOPIC` value) has its own, completely independent
+`cf_clearance` cookie at `miruro_api:cf_clearance:{FALLBACK_TOPIC}` — as well as its own
+need/refresh flag and pub/sub channel, both shown above. **Do not go back to one shared
+`cf_clearance` key across groups, even though a cookie is technically valid replayed from any
+IP** (see the header-set-not-IP note above) — that was the original design here, and it was
+wrong: sharing one cookie coupled every group's fate together. A break in one group's cookie
+made every node reading that same key 403 at once (regardless of group), and — because each
+node also holds its own few-second in-process copy (`CF_CLEARANCE_LOCAL_CACHE_SECONDS`) — two
+completely unrelated fallback groups could appear to "trigger each other" seconds apart. That
+was never one group waking the other (the topic-scoped trigger channels were already isolated
+even before this fix); it was two independent nodes racing against the *same* shared cookie,
+each hitting its own stale local copy at a slightly different moment. Confirmed live 2026-09-07
+(see `SESSION_LOG.md`) and fixed by giving every group its own cookie key, full stop — a group
+must live or die entirely on its own cookie, with zero coupling to any other group's.
 
 **Setup on a new machine** (Mac, Windows, or another Linux box — needs to be joined to the same
 ZeroTier network as the home node, to reach both Redis and `NOTIFY_RELAY_URL`):
