@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -105,11 +106,19 @@ def notify_telegram(message: str) -> None:
     except Exception:
         logger.exception("Fallo notificando por Telegram vía el relay")
 
-CHALLENGE_TIMEOUT_SECONDS = 45
 # Cloudflare's challenge page title, localized by the browser's Accept-Language — seen both as
 # English ("Just a moment...") and Spanish ("Un momento...") live.
 _CHALLENGE_TITLE_MARKERS = ("just a moment", "un momento")
-POLL_INTERVAL_SECONDS = 2
+
+# Confirmed live (windows_agent/test_late_attach.py): a Chrome launched with ZERO automation
+# attached — no Playwright/patchright control at all — clears Cloudflare's challenge on its own
+# within this window, the same way an ordinary human visit would. Only AFTER this wait do we
+# attach at all. This replaced an earlier approach where patchright launched and controlled the
+# browser from the very first navigation — that either never resolved, or resolved but with an
+# incomplete header capture (missing sec-fetch-*/cache-control/etc. — see CAPTURED_HEADER_NAMES
+# below) that made the resulting cookie fail live pipe calls even though the challenge cleared.
+NAKED_LAUNCH_WAIT_SECONDS = int(os.getenv("NAKED_LAUNCH_WAIT_SECONDS", "20"))
+DEBUG_PORT = 9222
 
 # Must match api.py's _encode_pipe_request exactly (plain base64 of the JSON, NOT gzipped —
 # only pipe *responses* are gzip-compressed, not requests).
@@ -222,79 +231,121 @@ CAPTURED_HEADER_NAMES = {
 
 
 async def _solve_challenge_and_capture():
+    """Launches the SAME Chromium patchright would normally control, but as a raw subprocess —
+    no Playwright/patchright attached at all — so Cloudflare's challenge gets solved exactly
+    like an ordinary browser visit, then waits untouched, and only THEN attaches via
+    connect_over_cdp to pull the cookie and headers."""
+    profile_dir = str(Path(__file__).resolve().parent / ".chrome-profile")
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        try:
-            context = await browser.new_context(viewport={"width": 1280, "height": 800})
-            page = await context.new_page()
+        chrome_path = p.chromium.executable_path
 
-            await page.goto(f"{MIRURO_BASE_URL}/", timeout=30000, wait_until="domcontentloaded")
+    proc = subprocess.Popen(
+        [
+            chrome_path,
+            f"--remote-debugging-port={DEBUG_PORT}",
+            f"--user-data-dir={profile_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            # Confirmed live: launching Chromium as a raw subprocess (not via patchright's own
+            # launch(), which handles this internally) hits Chromium's zygote sandbox init and
+            # crashes immediately under this environment (Xvfb + this user's namespace/AppArmor
+            # setup) without it — "FATAL: No usable sandbox!". Only affects this standalone
+            # process, not anything else on the machine.
+            "--no-sandbox",
+            f"{MIRURO_BASE_URL}/",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
-            cf_clearance = None
-            deadline = time.monotonic() + CHALLENGE_TIMEOUT_SECONDS
-            while time.monotonic() < deadline:
+    try:
+        await asyncio.sleep(NAKED_LAUNCH_WAIT_SECONDS)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.connect_over_cdp(f"http://localhost:{DEBUG_PORT}")
+            try:
+                context = browser.contexts[0]
+                page = context.pages[0] if context.pages else await context.new_page()
+
+                title = (await page.title()).lower()
+                if any(marker in title for marker in _CHALLENGE_TITLE_MARKERS):
+                    raise RuntimeError(
+                        f"still on the challenge screen after {NAKED_LAUNCH_WAIT_SECONDS}s — "
+                        "Cloudflare may have escalated to an interactive Turnstile."
+                    )
+
                 cookies = await context.cookies(MIRURO_BASE_URL)
                 match = next((c for c in cookies if c["name"] == "cf_clearance"), None)
-                if match:
-                    # A cf_clearance cookie can appear mid-challenge and get superseded by a
-                    # later, real one (confirmed live on windows_agent: the challenge visibly
-                    # ran twice before actually clearing) — don't trust it until the page has
-                    # actually navigated off the challenge screen.
-                    title = (await page.title()).lower()
-                    if not any(marker in title for marker in _CHALLENGE_TITLE_MARKERS):
-                        cf_clearance = match["value"]
-                        break
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                if not match:
+                    raise RuntimeError(
+                        f"no cf_clearance cookie present after {NAKED_LAUNCH_WAIT_SECONDS}s"
+                    )
 
-            if not cf_clearance:
-                raise RuntimeError(
-                    f"cf_clearance never showed up after {CHALLENGE_TIMEOUT_SECONDS}s — "
-                    "Cloudflare may have escalated to a harder challenge (interactive Turnstile)."
+                # request.headers() (from CDP's Network.requestWillBeSent) is missing headers
+                # Chromium adds later — confirmed live: accept-language, cache-control, pragma,
+                # priority, and all three sec-fetch-* were consistently absent, though Chromium
+                # attaches those to every request with no exception. Those show up in a separate
+                # CDP event (Network.requestWillBeSentExtraInfo). Merge both for the complete,
+                # real, as-sent header set.
+                target_url = f"{MIRURO_BASE_URL}/"
+                base_headers = {}
+
+                def on_request(request):
+                    if request.url == target_url:
+                        base_headers.update(request.headers)
+
+                page.on("request", on_request)
+
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Network.enable")
+                request_urls = {}
+                extra_headers_by_id = {}
+                cdp.on(
+                    "Network.requestWillBeSent",
+                    lambda p_: request_urls.__setitem__(p_["requestId"], p_.get("request", {}).get("url")),
+                )
+                cdp.on(
+                    "Network.requestWillBeSentExtraInfo",
+                    lambda p_: extra_headers_by_id.__setitem__(p_["requestId"], p_.get("headers", {})),
                 )
 
-            # Cloudflare grants the cookie and then navigates the challenge page to the real
-            # page — let that settle before we drive a same-origin fetch, or the evaluate()
-            # below races that navigation and blows up with "Execution context was destroyed".
-            try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
+                for attempt in range(3):
+                    try:
+                        await page.evaluate(
+                            "() => fetch(location.origin + '/', {cache: 'no-store'}).then(r => r.status)"
+                        )
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(1.5)
+                await asyncio.sleep(1.5)  # let both CDP events land — order isn't guaranteed
 
-            # A real top-level navigation's headers (sec-fetch-dest: document, no
-            # sec-fetch-site) don't match what api.py replays (an XHR-style GET), so capture
-            # headers from an actual same-origin fetch() instead, fired after things settle.
-            captured_request_headers = {}
+                matched_id = next((rid for rid, url in request_urls.items() if url == target_url), None)
+                extra_headers = extra_headers_by_id.get(matched_id, {}) if matched_id else {}
+                captured_request_headers = {**base_headers, **extra_headers}
 
-            def on_request(request):
-                if request.url.startswith(MIRURO_BASE_URL):
-                    captured_request_headers.update(request.headers)
+                if not captured_request_headers:
+                    raise RuntimeError("cleared the challenge but never captured a request's headers")
 
-            page.on("request", on_request)
-            for attempt in range(3):
-                try:
-                    await page.evaluate(
-                        "() => fetch(location.origin + '/', {cache: 'no-store'}).then(r => r.status)"
-                    )
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(1.5)
+                all_cookies = await context.cookies(MIRURO_BASE_URL)
+                cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in all_cookies)
 
-            if not captured_request_headers:
-                raise RuntimeError("cleared the challenge but never captured a request's headers")
-
-            all_cookies = await context.cookies(MIRURO_BASE_URL)
-            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in all_cookies)
-
-            headers = {
-                k.lower(): v
-                for k, v in captured_request_headers.items()
-                if k.lower() in CAPTURED_HEADER_NAMES
-            }
-            return cookie_str, headers
-        finally:
-            await browser.close()
+                headers = {
+                    k.lower(): v
+                    for k, v in captured_request_headers.items()
+                    if k.lower() in CAPTURED_HEADER_NAMES
+                }
+                return cookie_str, headers
+            finally:
+                await browser.close()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
 
 async def _current_ttl() -> int:

@@ -46,12 +46,23 @@ this to work reliably, both found the hard way (see `SESSION_LOG.md`, sessions 2
 
 1. **Getting the cookie**: solving the challenge requires a real, non-headless browser. Headless
    Chromium (plain Playwright, and `patchright`'s stealth fork) gets stuck on the challenge
-   forever. `cf_refresher.py` solves it with `patchright` in **non-headless** mode under **Xvfb**
-   (`xvfb-run -a`), which works in ~10-15s. It publishes `{cookie, headers}` as JSON to the Redis
-   key `miruro_api:cf_clearance` (`_get_pipe_headers()` reads it, cached in-process for
-   `CF_CLEARANCE_LOCAL_CACHE_SECONDS`). The cookie is **not** tied to the requesting IP (verified:
-   a cookie solved on one device works fine replayed from this server) — it's tied to the header
-   set (`sec-ch-ua`/`user-agent`/etc.) matching exactly what Cloudflare saw when it was issued.
+   forever. Beyond that, **the browser must have ZERO automation attached while the challenge
+   resolves** — confirmed live: launching Chrome with Playwright/patchright controlling it from
+   the first navigation (CDP active before the page even loads) either never cleared the
+   challenge, or cleared it with an incomplete header capture that made the resulting cookie
+   fail live pipe calls anyway. `cf_refresher.py`/`mac_agent/refresher.py` now launch the browser
+   as a **raw subprocess** (`--remote-debugging-port` open but nothing connected), wait
+   `NAKED_LAUNCH_WAIT_SECONDS` (default 20, under **Xvfb** on Linux via `xvfb-run -a`) completely
+   untouched, and only THEN attach via `connect_over_cdp` to pull the cookie. Header capture also
+   has to merge two CDP events — `Network.requestWillBeSent` (has `sec-ch-ua-*`/`user-agent`) and
+   `Network.requestWillBeSentExtraInfo` (has `sec-fetch-*`/`cache-control`/`pragma`/`priority`,
+   which Chromium always attaches but Playwright's simple `request.headers()` doesn't expose) —
+   using only the first one was silently producing incomplete, non-working cookies. Publishes
+   `{cookie, headers}` as JSON to the Redis key `miruro_api:cf_clearance` (`_get_pipe_headers()`
+   reads it, cached in-process for `CF_CLEARANCE_LOCAL_CACHE_SECONDS`). The cookie is **not**
+   tied to the requesting IP (verified: a cookie solved on one device works fine replayed from
+   this server) — it's tied to the header set (`sec-ch-ua`/`user-agent`/etc.) matching exactly
+   what Cloudflare saw when it was issued.
 2. **Replaying the cookie**: even with a byte-for-byte matching cookie+headers, the pipe still
    403s if the request goes out over plain **HTTP/1.1** — `curl_cffi` (any `impersonate=` profile)
    and httpx's default both failed live; only HTTP/2 (`httpx.AsyncClient(http2=True)`, matching
