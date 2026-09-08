@@ -226,13 +226,14 @@ def _encode_pipe_request(payload: dict) -> str:
 # in the query changes the cache key (confirmed: flips HIT to MISS, still 200) without the
 # backend rejecting it. Scoped to verification only — real traffic still caches normally.
 #
-# A single fixed anilistId got hammered by every node/verification all day (confirmed live
-# 2026-09-07: the same anilistId=21/provider=ally/sub sources query got a 444 from two
-# completely different IPs in the same session) — the resource itself, not any one node's IP,
-# looked flagged. _pick_canary_anilist_id() rotates through a pool of real, current TV anime
-# instead, and — via a Redis list shared across every node/group — never repeats one of the
-# last 3 ids picked by ANYONE, anywhere in the fleet.
-_VERIFY_PROVIDER = "ally"
+# A single fixed anilistId AND a single fixed provider got hammered by every node/verification
+# all day (confirmed live 2026-09-07: the same anilistId=21/provider=ally/sub sources query got
+# a 444 from two completely different IPs, and rotating ONLY the anilistId — leaving
+# provider="ally" fixed — still 444'd from a third attempt) — the resource itself (id AND
+# provider), not any one node's IP, looks like what's getting rate-limited/flagged. Both now
+# rotate independently through real, currently-working pools, and — via Redis lists shared
+# across every node/group — never repeat one of the last 3 values picked by ANYONE, anywhere in
+# the fleet.
 _VERIFY_CATEGORY = "sub"
 _CANARY_ANILIST_ID_POOL = [
     178789, 196187, 135865, 185874, 207141, 187538, 180136, 210031, 103303, 187260,
@@ -240,31 +241,42 @@ _CANARY_ANILIST_ID_POOL = [
     200637, 169583, 209983, 204466, 177637, 128757, 198409, 182616, 169582, 199066,
     199408, 194219,
 ]
+# Confirmed live against anilistId=178789: all six have real "sub" episodes available.
+_CANARY_PROVIDER_POOL = ["ally", "pewe", "bee", "kiwi", "hop", "bonk"]
 REDIS_KEY_CANARY_RECENT_IDS = "miruro_api:canary:recent_ids"
+REDIS_KEY_CANARY_RECENT_PROVIDERS = "miruro_api:canary:recent_providers"
 
 
-async def _pick_canary_anilist_id() -> int:
-    """Random pick from the pool, never repeating one of the last 3 ids picked by ANY node —
+async def _pick_avoiding_recent(redis_key: str, pool: list, cast=str):
+    """Random pick from `pool`, never repeating one of the last 3 values picked by ANY node —
     shared globally across all FALLBACK_TOPIC groups, since the thing being avoided is hammering
     one shared upstream resource, not a per-group concern."""
     import random
-    recent: list[int] = []
+    recent = []
     r = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
     try:
-        recent = [int(x) for x in await r.lrange(REDIS_KEY_CANARY_RECENT_IDS, 0, -1)]
+        recent = [cast(x) for x in await r.lrange(redis_key, 0, -1)]
     except Exception:
         pass
-    candidates = [i for i in _CANARY_ANILIST_ID_POOL if i not in recent] or _CANARY_ANILIST_ID_POOL
+    candidates = [i for i in pool if i not in recent] or pool
     picked = random.choice(candidates)
     try:
-        await r.rpush(REDIS_KEY_CANARY_RECENT_IDS, picked)
-        await r.ltrim(REDIS_KEY_CANARY_RECENT_IDS, -3, -1)
-        await r.expire(REDIS_KEY_CANARY_RECENT_IDS, 3600)
+        await r.rpush(redis_key, picked)
+        await r.ltrim(redis_key, -3, -1)
+        await r.expire(redis_key, 3600)
     except Exception:
         pass
     finally:
         await r.aclose()
     return picked
+
+
+async def _pick_canary_anilist_id() -> int:
+    return await _pick_avoiding_recent(REDIS_KEY_CANARY_RECENT_IDS, _CANARY_ANILIST_ID_POOL, int)
+
+
+async def _pick_canary_provider() -> str:
+    return await _pick_avoiding_recent(REDIS_KEY_CANARY_RECENT_PROVIDERS, _CANARY_PROVIDER_POOL, str)
 
 
 def _cache_bust() -> str:
@@ -314,6 +326,7 @@ async def _cookie_actually_works(cookie_str: str, headers: dict, verbose: bool =
     exactly like the challenge never resolved at all."""
     try:
         canary_anilist_id = await _pick_canary_anilist_id()
+        canary_provider = await _pick_canary_provider()
         episodes_payload = {
             "path": "episodes", "method": "GET",
             "query": {"anilistId": canary_anilist_id, "_cb": _cache_bust()},
@@ -331,7 +344,7 @@ async def _cookie_actually_works(cookie_str: str, headers: dict, verbose: bool =
 
         eps = (
             episodes_data.get("providers", {})
-            .get(_VERIFY_PROVIDER, {})
+            .get(canary_provider, {})
             .get("episodes", {})
             .get(_VERIFY_CATEGORY, [])
         )
@@ -344,7 +357,7 @@ async def _cookie_actually_works(cookie_str: str, headers: dict, verbose: bool =
             "method": "GET",
             "query": {
                 "episodeId": base64.urlsafe_b64encode(raw_episode_id.encode()).decode().rstrip("="),
-                "provider": _VERIFY_PROVIDER,
+                "provider": canary_provider,
                 "category": _VERIFY_CATEGORY,
                 "anilistId": canary_anilist_id,
                 "_cb": _cache_bust(),
