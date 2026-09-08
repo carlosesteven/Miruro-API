@@ -95,13 +95,32 @@ async def main():
             return
         print("[4/6] Got cf_clearance.")
 
-        captured_request_headers = {}
+        # Playwright's page.on("request") only exposes headers from the CDP event
+        # Network.requestWillBeSent — confirmed live: it was consistently missing
+        # accept-language, cache-control, pragma, priority, and all three sec-fetch-* headers,
+        # which Chromium ALWAYS attaches to every request with no exception. Those get added
+        # later, in a separate CDP event (Network.requestWillBeSentExtraInfo) that the simple
+        # request.headers() API doesn't surface. Capture BOTH — request.headers() has
+        # sec-ch-ua-*/accept/referer/user-agent correctly, ExtraInfo has the rest — and merge
+        # them for the complete, real, as-sent header set.
+        target_url = f"{MIRURO_BASE_URL}/"
+        base_headers = {}
 
         def on_request(request):
-            if request.url.startswith(MIRURO_BASE_URL):
-                captured_request_headers.update(request.headers)
+            if request.url == target_url:
+                base_headers.update(request.headers)
 
         page.on("request", on_request)
+
+        cdp = await context.new_cdp_session(page)
+        await cdp.send("Network.enable")
+
+        request_urls = {}        # requestId -> url
+        extra_headers_by_id = {}  # requestId -> headers
+
+        cdp.on("Network.requestWillBeSent", lambda p: request_urls.__setitem__(p["requestId"], p.get("request", {}).get("url")))
+        cdp.on("Network.requestWillBeSentExtraInfo", lambda p: extra_headers_by_id.__setitem__(p["requestId"], p.get("headers", {})))
+
         for attempt in range(3):
             try:
                 await page.evaluate(
@@ -112,6 +131,13 @@ async def main():
                 if attempt == 2:
                     raise
                 await asyncio.sleep(1.5)
+        await asyncio.sleep(1.5)  # let both CDP events land — order between them isn't guaranteed
+
+        matched_id = next((rid for rid, url in request_urls.items() if url == target_url), None)
+        extra_headers = extra_headers_by_id.get(matched_id, {}) if matched_id else {}
+        if not extra_headers:
+            print("      WARNING: couldn't match the ExtraInfo event — using request.headers only (incomplete)")
+        captured_request_headers = {**base_headers, **extra_headers}
 
         all_cookies = await context.cookies(MIRURO_BASE_URL)
         cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in all_cookies)
@@ -121,7 +147,7 @@ async def main():
             if k.lower() in CAPTURED_HEADER_NAMES
         }
         current_url = page.url
-        print("[5/6] Captured headers from a real same-origin request.")
+        print(f"[5/6] Captured {len(headers)} headers (request.headers + CDP ExtraInfo merged).")
 
         await browser.close()
 
