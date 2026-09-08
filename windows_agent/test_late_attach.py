@@ -120,9 +120,20 @@ async def main():
             for k, v in captured_request_headers.items()
             if k.lower() in CAPTURED_HEADER_NAMES
         }
+        current_url = page.url
         print("[5/6] Captured headers from a real same-origin request.")
 
         await browser.close()
+
+    print("\n----- RAW DATA (inspect this yourself before trusting the PASS/FAIL) -----")
+    print(f"page.url at capture time: {current_url}")
+    print(f"user-agent used:          {headers.get('user-agent')}")
+    print(f"sec-ch-ua used:           {headers.get('sec-ch-ua')}")
+    print(f"full cookie string:       {cookie_str}")
+    print("all captured headers:")
+    for k, v in sorted(headers.items()):
+        print(f"    {k}: {v}")
+    print("----------------------------------------------------------------------------\n")
 
     try:
         proc.terminate()
