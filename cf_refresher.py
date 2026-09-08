@@ -448,6 +448,19 @@ async def _solve_challenge_and_capture():
         except Exception:
             proc.kill()
 
+        # Chrome's own SingletonLock/SingletonCookie/SingletonSocket cleanup isn't guaranteed on
+        # a forced terminate/kill (it normally happens as part of Chrome's OWN graceful shutdown
+        # sequence) — confirmed live: these were still sitting in the profile dir after a cycle
+        # whose Chrome process had already fully exited. Chrome validates a lock's PID/hostname
+        # before trusting it, so a stale one is low-risk today, but explicit cleanup here removes
+        # any chance of a future cycle's launch getting forwarded to (or confused by) leftover
+        # state from a prior run instead of starting genuinely fresh every time.
+        for stale in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            try:
+                (Path(profile_dir) / stale).unlink(missing_ok=True)
+            except Exception:
+                pass
+
 
 async def _current_ttl() -> int:
     r = aioredis.Redis(
