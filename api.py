@@ -248,7 +248,10 @@ async def _get_pipe_headers() -> dict:
 BASE_DIR = Path(__file__).resolve().parent
 CF_REFRESHER_TRIGGER_LOCK_KEY = "miruro_api:cf_refresher:reactive_trigger_lock"
 CF_REFRESHER_TRIGGER_LOCK_TTL = 60  # de-dupes concurrent failing requests into one browser run
-HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
+# Only set on the home node's own .env — no hardcoded path with a real username in the repo.
+# Unset (any cloud node, or the home node before Hermes is configured) means os.path.exists("")
+# is False, falling through to the NOTIFY_RELAY_URL branch below, same as before.
+HERMES_BIN = os.getenv("HERMES_BIN_PATH", "")
 
 # Shared with cf_refresher.py (same literal key) — real, measured break-to-recovery timing
 # instead of anyone's guess. See _trigger_reactive_cf_refresh (sets it) and cf_refresher.py's
@@ -284,7 +287,7 @@ NODE_ID = os.getenv("NODE_ID") or socket.gethostname()
 # cloud node has no local Hermes to shell out to, so it relays the message over the shared
 # ZeroTier network to THIS node's own /internal/notify instead, which does have Hermes and
 # sends it for real. NOTIFY_RELAY_URL should be unset here (home) and set to this machine's
-# ZeroTier address (e.g. http://10.147.19.131:8848) in the .env of the 4 cloud nodes.
+# ZeroTier address (e.g. http://10.x.x.x:8848) in the .env of the 4 cloud nodes.
 NOTIFY_RELAY_URL = os.getenv("NOTIFY_RELAY_URL", "").rstrip("/")
 
 

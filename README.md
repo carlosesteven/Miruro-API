@@ -100,10 +100,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=carlos-esteven
-Group=carlos-esteven
-WorkingDirectory=/home/carlos-esteven/MI-API
-ExecStart=/bin/bash -c 'source /home/carlos-esteven/MI-API/venv/bin/activate && exec python -m uvicorn api:app --host 0.0.0.0 --port 8848 >> "/home/carlos-esteven/MI-API/uvicorn-$(date +%%F-%%H%%M%%S).log" 2>&1'
+User=REPLACE_WITH_YOUR_USER
+Group=REPLACE_WITH_YOUR_USER
+WorkingDirectory=/REPLACE/WITH/PATH/TO/MI-API
+ExecStart=/bin/bash -c 'source /REPLACE/WITH/PATH/TO/MI-API/venv/bin/activate && exec python -m uvicorn api:app --host 0.0.0.0 --port 8848 >> "/REPLACE/WITH/PATH/TO/MI-API/uvicorn-$(date +%%F-%%H%%M%%S).log" 2>&1'
 Restart=on-failure
 RestartSec=5
 

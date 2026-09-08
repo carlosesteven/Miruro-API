@@ -25,8 +25,8 @@ There is no test suite and no linting configuration.
 ## Deployment: 5 nodes, one is special
 
 This app runs on 5 nodes behind a load balancer: 4 cloud nodes + **this physical home machine**
-(`home.csc-lab.co`, reachable from the cloud nodes over ZeroTier at `10.147.19.131`). Only this
-home machine has Hermes (a personal agent framework) installed, which is how Telegram alerts get
+(reachable from the cloud nodes over ZeroTier at a private address — see `NOTIFY_RELAY_URL`
+below). Only this home machine has Hermes (a personal agent framework) installed, which is how Telegram alerts get
 sent — see `NOTIFY_RELAY_URL` below. All 5 nodes share the same Redis instance and the same
 `API_KEY`.
 
@@ -100,13 +100,13 @@ this to work reliably, both found the hard way (see `SESSION_LOG.md`, sessions 2
 ### `NOTIFY_RELAY_URL` — Telegram alerts from the 4 cloud nodes
 
 Only the home node has Hermes installed, so `notify_telegram()`/`_notify_telegram()` check for
-the local Hermes binary first (`/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes`); if
-it's missing (any cloud node), they POST `{"message": ...}` to `f"{NOTIFY_RELAY_URL}/internal/notify"`
-instead, authenticated with this deployment's own `API_KEY`. `POST /internal/notify` (in
-`api.py`) is what actually calls Hermes on the receiving end — it's a normal endpoint (not in the
-auth-bypass list), so it's protected by the same `x-api-key` check as everything else. Leave
-`NOTIFY_RELAY_URL` unset on the home node; set it to `http://10.147.19.131:8848` (the home
-node's ZeroTier address) on the 4 cloud nodes.
+a local Hermes binary first (path from the `HERMES_BIN_PATH` env var, set only on the home
+node's own `.env` — never hardcoded in code); if it's unset/missing (any cloud node), they POST
+`{"message": ...}` to `f"{NOTIFY_RELAY_URL}/internal/notify"` instead, authenticated with this
+deployment's own `API_KEY`. `POST /internal/notify` (in `api.py`) is what actually calls Hermes
+on the receiving end — it's a normal endpoint (not in the auth-bypass list), so it's protected
+by the same `x-api-key` check as everything else. Leave `NOTIFY_RELAY_URL` unset on the home
+node; set it to `http://<home-node-zerotier-ip>:8848` on the 4 cloud nodes.
 
 ### `cf_refresher.py` — ONE script, any OS, four modes
 
@@ -254,7 +254,8 @@ Episode IDs returned by the Miruro pipe are base64-encoded. `_translate_id()` de
 | `PIPE_USER_AGENT` | `Mozilla/5.0 (Windows NT 10.0; Win64; x64)` | User-Agent sent to the pipe |
 | `PIPE_EXTRA_HEADERS` | `{}` | JSON object merged into pipe request headers (e.g. `sec-ch-ua`, `accept`, `cf_clearance`-adjacent headers) — used to adapt to Cloudflare without touching code |
 | `CACHE_EPISODES_HOURS` | `1` | TTL (hours) for the `/episodes/{id}` cache |
-| `NOTIFY_RELAY_URL` | `` (empty) | Base URL of the home node (`http://10.147.19.131:8848` over ZeroTier), used by cloud nodes to relay Telegram alerts through `POST /internal/notify` when no local Hermes install exists. Leave unset on the home node itself. |
+| `NOTIFY_RELAY_URL` | `` (empty) | Base URL of the home node (its ZeroTier address, e.g. `http://10.x.x.x:8848`), used by cloud nodes to relay Telegram alerts through `POST /internal/notify` when no local Hermes install exists. Leave unset on the home node itself. |
+| `HERMES_BIN_PATH` | `` (empty) | Absolute path to the local Hermes CLI binary. Only set on the home node's own `.env`; unset/missing anywhere else falls through to `NOTIFY_RELAY_URL`. |
 | `NODE_ID` | OS hostname | Human-readable label for this node (e.g. `cloud-1`), appended to Telegram alerts as `[nodo: ...]` so you know which of the 5 nodes actually detected the failure. |
 
 ### Deployment targets

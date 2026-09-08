@@ -285,8 +285,8 @@ Falta que el usuario copie ambos a `/etc/systemd/system/`, `daemon-reload`, y `e
 2. **Sin debounce en la alerta de fallo — a pedido explícito del usuario** ("quiero spam al maldito telegram... hasta que resuelva, es un sistema crítico"): se sacó el debounce de 1h que tenía `cf_refresher.py` (`_alert_once`/`REDIS_KEY_LAST_ALERT` — eliminados del código, ya no existen). Ahora manda un mensaje cada vez que falla un intento forzado — en la práctica cada ~60s mientras la caída persista (limitado solo por el lock del punto 1, no por ningún cooldown de la alerta en sí).
 3. **Notificación desde los 5 nodos, no solo desde casa:** el usuario reveló que este servicio corre en 5 nodos detrás de un balanceador (este equipo físico + 4 nodos cloud), y **solo este equipo tiene Hermes instalado** (el framework de agente que manda a Telegram). Se agregó:
    - `POST /internal/notify` en `api.py` — recibe `{"message": "..."}`, protegido por el mismo `x-api-key` de siempre (no está en la lista de bypass de `secure_api`), y llama a `_notify_telegram()` internamente.
-   - `_notify_telegram()` (api.py) y `notify_telegram()` (cf_refresher.py) ahora chequean primero si existe el binario local de Hermes (`/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes`); si no existe (los 4 nodos cloud), en vez de fallar en silencio, hacen un POST a `f"{NOTIFY_RELAY_URL}/internal/notify"` (nueva env var) autenticado con el mismo `API_KEY` de siempre.
-   - Confirmado con el usuario: los 5 nodos comparten Redis y el mismo `API_KEY`. Este equipo es alcanzable desde los nodos cloud vía **ZeroTier** en `10.147.19.131:8848` (confirmado con `ip addr` — interfaces `ztr2qybuq2`/`ztrfyjgylc`). Falta que el usuario agregue `NOTIFY_RELAY_URL=http://10.147.19.131:8848` al `.env` de los 4 nodos cloud y los reinicie — sin eso, esos 4 nodos no pueden avisar por Telegram si son ellos los que detectan la falla.
+   - `_notify_telegram()` (api.py) y `notify_telegram()` (cf_refresher.py) ahora chequean primero si existe el binario local de Hermes (`<ruta al binario local de Hermes>`); si no existe (los 4 nodos cloud), en vez de fallar en silencio, hacen un POST a `f"{NOTIFY_RELAY_URL}/internal/notify"` (nueva env var) autenticado con el mismo `API_KEY` de siempre.
+   - Confirmado con el usuario: los 5 nodos comparten Redis y el mismo `API_KEY`. Este equipo es alcanzable desde los nodos cloud vía **ZeroTier** en `<ip-zerotier-home-node>:8848` (confirmado con `ip addr` — interfaces `ztr2qybuq2`/`ztrfyjgylc`). Falta que el usuario agregue `NOTIFY_RELAY_URL=http://<ip-zerotier-home-node>:8848` al `.env` de los 4 nodos cloud y los reinicie — sin eso, esos 4 nodos no pueden avisar por Telegram si son ellos los que detectan la falla.
 
 **Estado al cierre de esta sesión:**
 - API funcionando, verificado con IDs frescos sin caché.
@@ -294,7 +294,7 @@ Falta que el usuario copie ambos a `/etc/systemd/system/`, `daemon-reload`, y `e
 - Detección reactiva + alerta sin debounce aplicadas y probadas (`/internal/notify` responde 200 con key válida, 403 sin key).
 - **Pendiente (requiere acción del usuario, no lo pude hacer yo por falta de sudo/acceso a los otros nodos):**
   1. Instalar el timer systemd (`mi-api-cf-refresh.service`/`.timer`, en la raíz del repo) — ver sección anterior.
-  2. Agregar `NOTIFY_RELAY_URL=http://10.147.19.131:8848` al `.env` de los 4 nodos cloud y reiniciarlos.
+  2. Agregar `NOTIFY_RELAY_URL=http://<ip-zerotier-home-node>:8848` al `.env` de los 4 nodos cloud y reiniciarlos.
   3. Confirmar que `patchright`/Xvfb estén instalados en los nodos cloud si se espera que ellos también puedan resolver el challenge (si no, dependen de que el lock reactivo lo gane un nodo que sí pueda — típicamente este equipo de casa).
 
 ### Ajustes finales de la misma sesión, después de revisar el diseño con el usuario
@@ -305,7 +305,7 @@ Falta que el usuario copie ambos a `/etc/systemd/system/`, `daemon-reload`, y `e
 
 ### Segundo incidente el mismo día: Cloudflare escaló más, y un hueco en el canary
 
-Después de probar el nodo cloud (10.147.19.193/10.147.20.193, mismo equipo por dos redes ZeroTier — confirmado con `/health` respondiendo igual en ambas IPs), se detectó que **`/episodes` funcionaba pero `/watch` (cualquier anime/provider) daba 403 de forma sistémica** — no era un slug puntual. El canary agregado antes solo probaba la ruta `episodes`, así que consideraba "la cookie está bien" aunque `sources` (la ruta que usa `/watch`) estuviera rota, y no disparaba nada.
+Después de probar el nodo cloud (<ip-zerotier-red-1>/<ip-zerotier-red-2>, mismo equipo por dos redes ZeroTier — confirmado con `/health` respondiendo igual en ambas IPs), se detectó que **`/episodes` funcionaba pero `/watch` (cualquier anime/provider) daba 403 de forma sistémica** — no era un slug puntual. El canary agregado antes solo probaba la ruta `episodes`, así que consideraba "la cookie está bien" aunque `sources` (la ruta que usa `/watch`) estuviera rota, y no disparaba nada.
 
 **Fix:** `_cf_clearance_actually_broken()` ahora prueba **dos** canarios — `episodes` (anilistId 21) y, si ese pasa, `sources` (episodio 1 de One Piece por `ally`, obtenido dinámicamente del resultado del canario de `episodes` para no depender de un ID crudo hardcodeado que se pudiera desactualizar). Hace las llamadas crudas por `httpx` directo (no vía `_pipe_get`/`_fetch_raw_episodes`) para evitar recursión — esas funciones podrían volver a llamar a `_trigger_reactive_cf_refresh()` en un 403.
 
@@ -406,7 +406,7 @@ Con el fix confirmado, se portó el mismo merge + naked-launch a `windows_agent/
 
 ### Registro de otro server (Ubuntu + Windows, misma IP externa) — y unificación completa en UN SOLO script
 
-El usuario pidió armar un fallback completo (como el Mac) en un Ubuntu server nuevo (IP ZeroTier `10.147.20.193`) más un Windows en la misma red (`10.147.20.35`). Se empezó a crear `linux_agent/refresher.py` como copia de `mac_agent/refresher.py` adaptada a Xvfb/patchright — el usuario frenó esto en seco: **"para que mierda me creas el de linux/windows, no se puede reutilizar el código base y solo apuntar por .env?"** y luego **"porque si luego agrego más equipo cada puta nodo requiere código diferente? eso no puede ser."**
+El usuario pidió armar un fallback completo (como el Mac) en un Ubuntu server nuevo (IP ZeroTier `<ip-zerotier-ubuntu-nuevo>`) más un Windows en la misma red (`<ip-zerotier-windows>`). Se empezó a crear `linux_agent/refresher.py` como copia de `mac_agent/refresher.py` adaptada a Xvfb/patchright — el usuario frenó esto en seco: **"para que mierda me creas el de linux/windows, no se puede reutilizar el código base y solo apuntar por .env?"** y luego **"porque si luego agrego más equipo cada puta nodo requiere código diferente? eso no puede ser."**
 
 Tenía toda la razón — la única diferencia real entre `cf_refresher.py`, `mac_agent/refresher.py` y `windows_agent/test_cookie.py` era "cómo encuentro/lanzo un Chrome pelado en este SO"; el resto (verificación de dos canarios con cache-bust, captura de headers con merge CDP, notificación por Telegram, escucha pub/sub + poll, escritura a Redis) era código idéntico copiado tres veces.
 

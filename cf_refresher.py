@@ -91,7 +91,10 @@ MIN_TTL_BEFORE_REFRESH_SECONDS = 10 * 60
 # the user explicitly wants a message every time this fires until it's fixed. In practice that's
 # capped at once/minute anyway: api.py's reactive trigger only fires once per its own 60s lock,
 # no matter how many requests are failing concurrently.
-HERMES_BIN = "/home/carlos-esteven/.hermes/hermes-agent/venv/bin/hermes"
+# Only set on the home node's own .env — no hardcoded path with a real username in the repo.
+# Unset (any other machine) means os.path.exists("") is False, falling through to the
+# NOTIFY_RELAY_URL branch below, same as before.
+HERMES_BIN = os.getenv("HERMES_BIN_PATH", "")
 
 # Only the home node has Hermes installed locally; every other machine relays through it — see
 # NOTIFY_RELAY_URL in api.py for the full rationale. Leave unset on the home node.
