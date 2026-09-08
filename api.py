@@ -320,8 +320,6 @@ def _notify_telegram(message: str) -> None:
 
 
 # Known-good, stable canary queries for validating whether cf_clearance itself is actually dead.
-# anilistId 21 (One Piece) is about as safe a bet as exists for "this is in Miruro's catalog" —
-# confirmed to keep working across everything else that happened today.
 #
 # IMPORTANT #1: Cloudflare/Miruro evaluate different pipe "path" values independently — confirmed
 # live: a cookie can 200 on "episodes" while 403ing on EVERY "sources" query (any anime, any
@@ -339,9 +337,44 @@ def _notify_telegram(message: str) -> None:
 # plus one junk field flips `cf-cache-status` from HIT to MISS, still 200) without Miruro's
 # backend rejecting the unrecognized field — so every canary call below gets its own cache-busted
 # copy of the query, guaranteeing it actually reaches the origin.
-_CANARY_SOURCES_ANILIST_ID = 21
+#
+# IMPORTANT #3: a single fixed anilistId got hammered by EVERY node/verification all day
+# (confirmed live 2026-09-07: the exact same anilistId=21/provider=ally/sub sources query got a
+# 444 from two completely different IPs within the same session) — the resource itself, not any
+# one node's IP, looked like what got rate-limited/flagged. _pick_canary_anilist_id() rotates
+# through a pool of real, current TV anime (SUMMER 2026, fetched from AniList) instead of always
+# hitting the same one, and — via REDIS_KEY_CANARY_RECENT_IDS, shared across every node/group —
+# never repeats one of the last 3 ids picked by ANYONE, anywhere in the fleet.
 _CANARY_SOURCES_PROVIDER = "ally"
 _CANARY_SOURCES_CATEGORY = "sub"
+_CANARY_ANILIST_ID_POOL = [
+    178789, 196187, 135865, 185874, 207141, 187538, 180136, 210031, 103303, 187260,
+    159309, 177699, 185542, 198946, 202269, 194829, 201514, 190569, 199111, 188139,
+    200637, 169583, 209983, 204466, 177637, 128757, 198409, 182616, 169582, 199066,
+    199408, 194219,
+]
+REDIS_KEY_CANARY_RECENT_IDS = "miruro_api:canary:recent_ids"
+
+
+async def _pick_canary_anilist_id() -> int:
+    """Random pick from the pool, never repeating one of the last 3 ids picked by ANY node —
+    the recent-ids list is global (not per FALLBACK_TOPIC group), since the thing being avoided
+    is hammering one shared upstream resource, not a per-group concern."""
+    import random
+    recent: list[int] = []
+    try:
+        recent = [int(x) for x in await redis_client.lrange(REDIS_KEY_CANARY_RECENT_IDS, 0, -1)]
+    except Exception:
+        pass
+    candidates = [i for i in _CANARY_ANILIST_ID_POOL if i not in recent] or _CANARY_ANILIST_ID_POOL
+    picked = random.choice(candidates)
+    try:
+        await redis_client.rpush(REDIS_KEY_CANARY_RECENT_IDS, picked)
+        await redis_client.ltrim(REDIS_KEY_CANARY_RECENT_IDS, -3, -1)
+        await redis_client.expire(REDIS_KEY_CANARY_RECENT_IDS, 3600)
+    except Exception:
+        pass
+    return picked
 
 
 def _cache_bust() -> str:
@@ -381,9 +414,10 @@ async def _cf_clearance_actually_broken() -> bool:
             return None
         return _decode_pipe_response(res.text.strip())
 
+    canary_anilist_id = await _pick_canary_anilist_id()
     episodes_payload = {
         "path": "episodes", "method": "GET",
-        "query": {"anilistId": _CANARY_SOURCES_ANILIST_ID, "_cb": _cache_bust()},
+        "query": {"anilistId": canary_anilist_id, "_cb": _cache_bust()},
         "body": None, "version": "0.1.0",
     }
     try:
@@ -412,7 +446,7 @@ async def _cf_clearance_actually_broken() -> bool:
                 "episodeId": base64.urlsafe_b64encode(raw_episode_id.encode()).decode().rstrip("="),
                 "provider": _CANARY_SOURCES_PROVIDER,
                 "category": _CANARY_SOURCES_CATEGORY,
-                "anilistId": _CANARY_SOURCES_ANILIST_ID,
+                "anilistId": canary_anilist_id,
                 "_cb": _cache_bust(),
             },
             "body": None,
