@@ -36,7 +36,10 @@ import redis.asyncio as aioredis
 REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
-REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance"
+# Cookie is per FALLBACK_TOPIC group now (each group isolated end to end, cookie included) —
+# this MCP runs on the home node, so it checks THIS node's own group.
+FALLBACK_TOPIC = os.getenv("FALLBACK_TOPIC", "default")
+REDIS_KEY_CF_CLEARANCE = f"miruro_api:cf_clearance:{FALLBACK_TOPIC}"
 
 mcp = FastMCP("mi-api")
 

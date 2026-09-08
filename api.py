@@ -39,7 +39,18 @@ CACHE_EPISODES_TTL = CACHE_EPISODES_HOURS * 3600  # seconds
 # --- Redis Cache Keys ---
 REDIS_KEY_RECENT_EPISODES = "miruro_api:cache:recent_episodes"
 REDIS_KEY_EPISODES_PREFIX = "miruro_api:cache:episodes"
-REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance"
+
+# Isolates fallback groups end to end — the cf_clearance cookie itself, not just who gets
+# notified of a break. Two groups sharing one cookie meant either could "rescue" the other, but
+# it also meant a node's own local cache staleness (CF_CLEARANCE_LOCAL_CACHE_SECONDS) could make
+# it look like group B's fix was "caused by" group A firing seconds apart — actually just two
+# independent nodes racing against the same shared cookie. Full isolation: each group solves,
+# holds, and lives or dies by its own cookie. Set the SAME FALLBACK_TOPIC here and on every
+# --listen node meant to answer for this production node; a different topic never shares a
+# cookie, notification channel, or anything else with this one. Defaults to "default" (one
+# shared pool) if unset.
+FALLBACK_TOPIC = os.getenv("FALLBACK_TOPIC", "default")
+REDIS_KEY_CF_CLEARANCE = f"miruro_api:cf_clearance:{FALLBACK_TOPIC}"
 
 # How long to trust an in-memory copy of the cf_clearance blob before re-checking Redis. Kept
 # short on purpose — a stale in-memory copy right after a manual push looked exactly like a
@@ -252,12 +263,9 @@ REDIS_KEY_BREAK_DETECTED_AT = "miruro_api:cf_refresher:break_detected_at"
 # every 30-60min as a safety net; REDIS_CHANNEL_MAC_REFRESH is the instant-reaction path when a
 # --listen node's listener happens to be connected at that moment.
 #
-# FALLBACK_TOPIC segments this into isolated groups — only --listen nodes sharing the SAME
-# FALLBACK_TOPIC as THIS node hear its triggers. Set the same value here and on whichever
-# --listen nodes are meant to answer for this node; give a different group a different value so
-# they never react to each other's breaks. Defaults to "default" (one shared group, the common
-# case) if unset.
-FALLBACK_TOPIC = os.getenv("FALLBACK_TOPIC", "default")
+# FALLBACK_TOPIC (defined above, next to REDIS_KEY_CF_CLEARANCE) segments this into isolated
+# groups too — only --listen nodes sharing the SAME FALLBACK_TOPIC as THIS node hear its
+# triggers, on top of already having their own separate cookie.
 REDIS_KEY_NEED_MAC_REFRESH = f"miruro_api:need_mac_refresh:{FALLBACK_TOPIC}"
 REDIS_CHANNEL_MAC_REFRESH = f"miruro_api:mac_refresh_channel:{FALLBACK_TOPIC}"
 MAC_ESCALATION_TIMEOUT_SECONDS = 120  # grace period before concluding NOBODY fixed it

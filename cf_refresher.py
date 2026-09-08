@@ -58,7 +58,15 @@ REDIS_HOST = os.getenv("REDIS_HOST")
 REDIS_PORT = int(os.getenv("REDIS_PORT"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
-REDIS_KEY_CF_CLEARANCE = "miruro_api:cf_clearance"
+# FALLBACK_TOPIC segments an entire group end to end — the cookie itself, not just who gets
+# woken up. Set the SAME FALLBACK_TOPIC on api.py's own .env and on every --listen node meant to
+# answer for it, and a DIFFERENT one for an isolated group — e.g. api.py (or whichever production
+# node) set to "groupA" shares a cookie only with the --listen nodes also set to "groupA" (say,
+# one Ubuntu + the Mac), completely independent from "groupB" (a second Ubuntu + the Windows
+# box) — a break, a fix, or a cookie in one group has zero effect on the other. Defaults to
+# "default" so a single-group deployment (the common case) needs nothing set.
+FALLBACK_TOPIC = os.getenv("FALLBACK_TOPIC", "default")
+REDIS_KEY_CF_CLEARANCE = f"miruro_api:cf_clearance:{FALLBACK_TOPIC}"
 REDIS_TTL_SECONDS = 25 * 60  # safety net: if nothing refreshes it in time, api.py falls back to
                               # its static headers (no cookie) once this expires, rather than
                               # replaying a stale, already-invalid cookie forever.
@@ -70,14 +78,6 @@ REDIS_KEY_BREAK_DETECTED_AT = "miruro_api:cf_refresher:break_detected_at"
 
 # --listen mode trigger (see api.py's _trigger_reactive_cf_refresh, which publishes/sets both of
 # these alongside the home server's own one-shot attempt).
-#
-# FALLBACK_TOPIC segments this: only --listen nodes sharing the SAME topic hear each other's
-# triggers. Set the SAME FALLBACK_TOPIC on api.py's own .env and on every --listen node meant to
-# answer for it, and a DIFFERENT one for an isolated group — e.g. api.py (or whichever production
-# node) set to "groupA" only wakes up the --listen nodes also set to "groupA" (say, one Ubuntu +
-# the Mac), never the ones on "groupB" (a second Ubuntu + the Windows box). Defaults to "default"
-# so a single-group deployment (the common case) needs nothing set.
-FALLBACK_TOPIC = os.getenv("FALLBACK_TOPIC", "default")
 REDIS_KEY_NEED_FALLBACK_REFRESH = f"miruro_api:need_mac_refresh:{FALLBACK_TOPIC}"
 REDIS_CHANNEL_FALLBACK_REFRESH = f"miruro_api:mac_refresh_channel:{FALLBACK_TOPIC}"
 FALLBACK_POLL_INTERVAL_SECONDS = int(os.getenv("FALLBACK_POLL_INTERVAL_SECONDS", str(30 * 60)))
